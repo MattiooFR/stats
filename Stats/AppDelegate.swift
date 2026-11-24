@@ -69,6 +69,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         app.run()
     }
     
+    // STATS_DEBUG_POPUPS=<file>: open every popup under the wallpaper and write "module windowNumber" lines to the file
+    private func debugPopups() {
+        guard let path = ProcessInfo.processInfo.environment["STATS_DEBUG_POPUPS"], !path.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            var lines: [String] = []
+            // STATS_DEBUG_HOVER=<module>: the pointer enters the first card of that popup, moves to the second, leaves
+            let hover = ProcessInfo.processInfo.environment["STATS_DEBUG_HOVER"] ?? ""
+            if let module = modules.first(where: { $0.name == hover }) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { module.debugHover(0, enter: true) }
+                // STATS_DEBUG_CLICK=<n>: then a click on the n-th period of the range switch
+                if let index = Int(ProcessInfo.processInfo.environment["STATS_DEBUG_CLICK"] ?? "") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                        print("STATS_DEBUG_CLICK: \(ISDetailController.shared.debugClickRange(index))")
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                    module.debugHover(0, enter: false)
+                    module.debugHover(1, enter: true)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { module.debugHover(1, enter: false) }
+            }
+            var x: CGFloat = hover.isEmpty ? 20 : 420
+            for module in modules {
+                if let id = module.debugShowPopup(at: NSPoint(x: x, y: 100)) {
+                    lines.append("\(module.name) \(id)")
+                    x += 40
+                }
+            }
+            // the side panels (history, details) of every popup, opened on their own
+            var dx: CGFloat = 20
+            for module in modules where ProcessInfo.processInfo.environment["STATS_DEBUG_NODETAILS"] == nil {
+                for (id, number) in module.debugShowDetails(from: NSPoint(x: dx, y: 100)) {
+                    lines.append("detail-\(module.name)-\(id) \(number)")
+                    dx += 40
+                }
+            }
+            // menu bar widgets rendered on a dark strip (the system draws the real menu bar items itself)
+            let dir = (path as NSString).deletingLastPathComponent
+            for module in modules where module.enabled && !module.menuBar.activeWidgets.isEmpty {
+                let view = module.menuBar.view
+                guard view.bounds.width > 0, view.bounds.height > 0,
+                      let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+                view.cacheDisplay(in: view.bounds, to: rep)
+                let image = NSImage(size: view.bounds.size, flipped: false) { rect in
+                    NSColor(white: 0.12, alpha: 1).setFill()
+                    rect.fill()
+                    rep.draw(in: rect)
+                    return true
+                }
+                if let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
+                   let png = bitmap.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: "\(dir)/widget-\(module.name).png"))
+                }
+            }
+            try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+    
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         let startingPoint = self.launchStart ?? Date()
         
@@ -80,6 +138,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             modules.reversed().forEach{ $0.mount() }
             self.modulesMounted = true
             self.showSettingsIfNoActiveWidgets()
+            self.debugPopups()
         }
         self.defaultValues()
         self.icon()

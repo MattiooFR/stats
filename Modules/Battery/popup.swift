@@ -12,468 +12,936 @@
 import Cocoa
 import Kit
 
+// one point of the level history: how full the battery was and where the power came from
+private struct BatterySample {
+    let level: Double
+    let onAC: Bool
+}
+
 internal class Popup: PopupWrapper {
-    private let chartHistory = BatteryChartData()
-    private let dashboardHeight: CGFloat = 160
-    
-    private var dashboardBatteryView: BatteryView? = nil
-    private var dashboardBatteryStatus: BatteryStatus? = nil
-    private var levelField: NSTextField? = nil
-    private var chart: BatteryChartView? = nil
-    
-    private var sourceField: NSTextField? = nil
-    private var timeLabelField: NSTextField? = nil
-    private var timeField: NSTextField? = nil
-    private var powerField: NSTextField? = nil
-    private var currentField: NSTextField? = nil
-    private var voltageField: NSTextField? = nil
-    
-    private var batterySection: NSView? = nil
-    private var barView: BarChartView? = nil
-    private var maxCapacityField: NSTextField? = nil
-    private var designedCapacityField: NSTextField? = nil
-    private var healthField: NSTextField? = nil
-    private var cyclesField: NSTextField? = nil
-    private var temperatureField: NSTextField? = nil
-    
-    private var adapterView: NSView? = nil
-    private var chargingStateField: StatusBadgeView? = nil
-    private var adapterPowerField: NSTextField? = nil
-    private var adapterCurrentField: NSTextField? = nil
-    private var adapterVoltageField: NSTextField? = nil
-    
-    private var processesView: NSView? = nil
-    private var processes: ProcessesView? = nil
+    // Stats stores no battery history: the popup keeps its own, one point a minute, 24 hours
+    private let levelHistory = ISHistory<BatterySample>(capacity: 1440)
+    private var lastSampleAt: Date? = nil
+    private var lastSampleOnAC: Bool? = nil
+
+    private var levelRing: ISRing? = nil
+    private var healthRing: ISRing? = nil
+    private var chart: ISBarChart? = nil
+    private var strip: BatterySourceStrip? = nil
+
+    private var modeCard: ISCard? = nil
+
+    private var significantApps: ISProcessList? = nil
+    private var significantNone: NSView? = nil
+    private var processes: ISProcessList? = nil
+
+    private var adapterCard: ISCard? = nil
+    private var adapterPowerRow: ISRow? = nil
+    private var adapterCurrentRow: ISRow? = nil
+    private var adapterVoltageRow: ISRow? = nil
+    private var chargingRow: ISRow? = nil
+
+    private var powerRow: ISRow? = nil
+    private var currentRow: ISRow? = nil
+    private var voltageRow: ISRow? = nil
+    private var temperatureRow: ISRow? = nil
+    private var sourceRow: ISRow? = nil
+    private var timeRow: ISRow? = nil
+
+    private var cyclesRow: ISRow? = nil
+    private var conditionRow: ISRow? = nil
+    private var designCapacityRow: ISRow? = nil
+    private var maxCapacityRow: ISRow? = nil
+
     private let processesCache = PopupCache<[TopProcess]>()
-    
     private let usageCache = PopupCache<Battery_Usage>()
-    
+
+    // energy mode of the current power source, read with pmset on a background queue
+    private var modeInfo: PowerModeInfo? = nil
+    private var modeReadAt: Date? = nil
+    private var modeReading: Bool = false
+    private var modeReadAgain: Bool = false
+    private var modeChanging: Bool = false
+
+    // battery condition, only fetched when the reader does not provide it (Apple silicon)
+    private var condition: String? = nil
+    private var conditionReadAt: Date? = nil
+    private var conditionReading: Bool = false
+
+    // process pid -> pid of the app it is shown under (0 = not an app)
+    private var ownerCache: [Int: pid_t] = [:]
+
+    private let bolt = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
+    private let barWidth: CGFloat = 2
+    private let barGap: CGFloat = 1
+    // "energy impact" (the power column of top) from which an app is listed as using significant energy
+    private let significantPower: Double = 20
+
     private var numberOfProcesses: Int {
-        Store.shared.int(key: "\(self.title)_processes", defaultValue: 8)
-    }
-    private var processesHeight: CGFloat {
-        (Constants.Popup.processHeight*CGFloat(self.numberOfProcesses)) + (self.numberOfProcesses == 0 ? 0 : Constants.Popup.separatorHeight + 22)
+        Store.shared.int(key: "\(self.title)_processes", defaultValue: 5)
     }
     private var timeFormat: String {
         Store.shared.string(key: "\(self.title)_timeFormat", defaultValue: "short")
     }
-    
+    private var contentWidth: CGFloat {
+        self.frame.width - (ISMetrics.padH * 2)
+    }
+    private var modeTitle: String {
+        isL("Energy Mode", fr: "Mode d’énergie")
+    }
+
     public init(_ module: ModuleType) {
-        super.init(module, frame: NSRect(x: 0, y: 0, width: Constants.Popup.width, height: 0))
-        
-        self.spacing = 0
+        super.init(module, frame: NSRect(x: 0, y: 0, width: 240, height: 0))
+
+        self.spacing = ISMetrics.spacing
         self.orientation = .vertical
     }
-    
-    public override func loadContent() {
-        self.addArrangedSubview(self.initDashboard())
-        self.addArrangedSubview(self.initChart())
-        self.addArrangedSubview(self.initDetails())
-        self.addArrangedSubview(self.initBattery())
-        self.addArrangedSubview(self.initProcesses())
-        
-        self.recalculateHeight()
-    }
-    
-    public override func unloadContent() {
-        self.dashboardBatteryView = nil
-        self.dashboardBatteryStatus = nil
-        self.levelField = nil
-        self.chart = nil
-        self.sourceField = nil
-        self.timeLabelField = nil
-        self.timeField = nil
-        self.powerField = nil
-        self.currentField = nil
-        self.voltageField = nil
-        self.batterySection = nil
-        self.barView = nil
-        self.maxCapacityField = nil
-        self.designedCapacityField = nil
-        self.healthField = nil
-        self.cyclesField = nil
-        self.temperatureField = nil
-        self.adapterView = nil
-        self.chargingStateField = nil
-        self.adapterPowerField = nil
-        self.adapterCurrentField = nil
-        self.adapterVoltageField = nil
-        self.processesView = nil
-        self.processes = nil
-    }
-    
+
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
-    
+
+    public override func loadContent() {
+        self.addSection(self.initRings())
+        self.addSection(self.initHistory())
+        self.addSection(self.initMode())
+        if self.numberOfProcesses > 0 {
+            self.addSection(self.initSignificant())
+            self.addSection(self.initProcesses())
+        }
+        self.addSection(ISShortcutBar(module: .battery, extra: [
+            ISShortcut.link(
+                "x-apple.systempreferences:com.apple.Battery-Settings.extension",
+                symbol: "battery.100",
+                toolTip: isL("Battery Settings", fr: "Réglages Batterie")
+            )
+        ]))
+
+        self.resizeToFitContent()
+    }
+
+    public override func unloadContent() {
+        self.levelRing = nil
+        self.healthRing = nil
+        self.chart = nil
+        self.strip = nil
+        self.modeCard = nil
+        self.significantApps = nil
+        self.significantNone = nil
+        self.processes = nil
+        self.adapterCard = nil
+        self.adapterPowerRow = nil
+        self.adapterCurrentRow = nil
+        self.adapterVoltageRow = nil
+        self.chargingRow = nil
+        self.powerRow = nil
+        self.currentRow = nil
+        self.voltageRow = nil
+        self.temperatureRow = nil
+        self.sourceRow = nil
+        self.timeRow = nil
+        self.cyclesRow = nil
+        self.conditionRow = nil
+        self.designCapacityRow = nil
+        self.maxCapacityRow = nil
+    }
+
     public override func appear() {
-        self.replay(self.processesCache, render: self.renderProcesses)
+        self.ownerCache.removeAll()
         self.replay(self.usageCache, render: self.renderUsage)
-        self.chart?.display()
+        self.replay(self.processesCache, render: self.renderProcesses)
+        self.renderMode()
+        self.renderCondition()
+        self.refreshMode()
+        self.refreshCondition()
     }
-    
-    public override func disappear() {
-        self.processes?.setLock(false)
+
+    // MARK: - Views
+
+    private func initRings() -> NSView {
+        let card = ISCard()
+        card.edgeInsets = NSEdgeInsets(top: ISMetrics.padV, left: 16, bottom: ISMetrics.padV, right: 16)
+
+        let row = ISRingRow(count: 2, diameter: 96, lineWidth: 7, vertical: 2)
+        card.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: card.widthAnchor, constant: -32).isActive = true
+
+        self.levelRing = row.rings[0]
+        self.healthRing = row.rings[1]
+        self.levelRing?.setText("—", caption: localizedString("Battery"))
+        self.healthRing?.setText("—", caption: localizedString("Health"))
+        self.attachDetails(card)
+
+        return card
     }
-    
-    private func recalculateHeight() {
-        var h: CGFloat = 0
-        self.arrangedSubviews.forEach { v in
-            if let v = v as? NSStackView {
-                h += v.arrangedSubviews.map({ $0.fittingSize.height }).reduce(0, +)
+
+    private func initHistory() -> NSView {
+        let theme = ISTheme.current
+        let card = ISCard()
+        card.edgeInsets = NSEdgeInsets(top: 8, left: ISMetrics.padH, bottom: 4, right: ISMetrics.padH)
+
+        // blue while on the power adapter, pink while on battery
+        let chart = ISBarChart(colors: [theme.blue, theme.pink], height: 48)
+        chart.barWidth = self.barWidth
+        chart.gap = self.barGap
+        chart.maxValue = 1
+        card.add(chart, spacingAfter: 1)
+        self.chart = chart
+
+        let strip = BatterySourceStrip(height: 14)
+        strip.barWidth = self.barWidth
+        strip.gap = self.barGap
+        card.add(strip)
+        self.strip = strip
+        self.attachDetails(card)
+
+        return card
+    }
+
+    private func initMode() -> NSView {
+        let card = ISCard(title: self.modeTitle, value: "—")
+        card.onClick = { [weak self] in
+            self?.showModeMenu()
+        }
+        // hidden on Macs without an energy mode setting
+        card.isHidden = self.modeReadAt != nil && self.modeInfo == nil
+        self.modeCard = card
+        return card
+    }
+
+    private func initSignificant() -> NSView {
+        let theme = ISTheme.current
+        let title = isL("Using Significant Energy", fr: "Haute consommation d’énergie").uppercased()
+        // the French title is wider than the card: it goes on two lines, as in iStat Menus
+        let lines = self.wrap(title, font: ISFont.label(13), width: self.contentWidth - 16)
+        let card = ISCard(title: lines.first ?? title)
+        lines.dropFirst().forEach { card.add(self.textRow($0, color: theme.title)) }
+
+        let none = self.textRow(localizedString("None"), color: theme.value)
+        card.add(none)
+        self.significantNone = none
+
+        let list = ISProcessList(n: 5)
+        list.isHidden = true
+        card.add(list)
+        self.significantApps = list
+
+        return card
+    }
+
+    private func initProcesses() -> NSView {
+        let card = ISCard(title: isL("Processes", fr: "Processus"))
+        let list = ISProcessList(n: self.numberOfProcesses)
+        card.add(list)
+        self.processes = list
+        return card
+    }
+
+    // as in iStat Menus, the figures of the adapter, the battery and its health are not in the menu:
+    // they open next to it while the pointer is on the gauges or on the history
+    private func attachDetails(_ card: ISCard) {
+        card.detailID = "details"
+        card.detail = { [weak self] in
+            self?.detailsPanel() ?? NSView()
+        }
+    }
+
+    private func detailsPanel() -> NSView {
+        let stack = ISDetailStack(width: self.frame.width, ranges: false)
+        stack.add(self.initAdapter())
+        stack.add(self.initBattery())
+        stack.add(self.initHealth())
+        if let value = self.usageCache.value {
+            self.renderUsage(value)
+        }
+        self.renderCondition()
+        return stack
+    }
+
+    private func initAdapter() -> NSView {
+        let card = ISCard(title: localizedString("Power adapter"))
+
+        let power = ISRow(localizedString("Power"))
+        let current = ISRow(isL("Amperage", fr: "Ampérage"))
+        let voltage = ISRow(localizedString("Voltage"))
+        let charging = ISRow(localizedString("Is charging"))
+        [power, current, voltage, charging].forEach { card.add($0) }
+
+        self.adapterPowerRow = power
+        self.adapterCurrentRow = current
+        self.adapterVoltageRow = voltage
+        self.chargingRow = charging
+
+        // only shown while the Mac is plugged in
+        card.isHidden = self.usageCache.value?.isBatteryPowered ?? true
+        self.adapterCard = card
+        return card
+    }
+
+    private func initBattery() -> NSView {
+        let card = ISCard(title: localizedString("Battery"))
+
+        let power = ISRow(localizedString("Power"))
+        let current = ISRow(isL("Amperage", fr: "Ampérage"))
+        let voltage = ISRow(localizedString("Voltage"))
+        let heat = ISRow(localizedString("Temperature"))
+        let source = ISRow(localizedString("Source"))
+        let time = ISRow(localizedString("Time to discharge"))
+        [power, current, voltage, heat, source, time].forEach { card.add($0) }
+
+        self.powerRow = power
+        self.currentRow = current
+        self.voltageRow = voltage
+        self.temperatureRow = heat
+        self.sourceRow = source
+        self.timeRow = time
+
+        return card
+    }
+
+    private func initHealth() -> NSView {
+        let card = ISCard(title: localizedString("Health"))
+
+        let cycles = ISRow(isL("Charge cycles", fr: "Cycles de charge"))
+        let condition = ISRow(isL("Condition", fr: "Conditions"))
+        let design = ISRow(isL("Design capacity", fr: "Capacité théorique"))
+        // iStat calls it the current capacity: what the battery holds today when full
+        let full = ISRow(isL("Current capacity", fr: "Capacité actuelle"))
+        full.toolTip = localizedString("Max capacity")
+        [cycles, condition, design, full].forEach { card.add($0) }
+        condition.setPlain("—")
+
+        self.cyclesRow = cycles
+        self.conditionRow = condition
+        self.designCapacityRow = design
+        self.maxCapacityRow = full
+
+        return card
+    }
+
+    // a line of plain text, as high as a row (second title line, "None")
+    private func textRow(_ string: String, color: NSColor) -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.heightAnchor.constraint(equalToConstant: ISMetrics.row).isActive = true
+
+        let field = ISText(string, font: ISFont.label(13), color: color)
+        view.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            field.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor),
+            field.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+        ])
+
+        return view
+    }
+
+    private func wrap(_ string: String, font: NSFont, width: CGFloat) -> [String] {
+        var lines: [String] = []
+        var line = ""
+        for word in string.split(separator: " ") {
+            let candidate = line.isEmpty ? String(word) : "\(line) \(word)"
+            if !line.isEmpty && candidate.widthOfString(usingFont: font) > width {
+                lines.append(line)
+                line = String(word)
             } else {
-                h += v.fittingSize.height
+                line = candidate
             }
         }
-        if self.frame.size.height != h {
-            self.setFrameSize(NSSize(width: self.frame.width, height: h))
-            self.sizeCallback?(self.frame.size)
-        }
+        if !line.isEmpty { lines.append(line) }
+        return lines
     }
-    
-    private func initDashboard() -> NSView {
-        let view: NSStackView = NSStackView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: self.dashboardHeight))
-        view.heightAnchor.constraint(equalToConstant: view.bounds.height).isActive = true
-        view.orientation = .vertical
-        view.spacing = 0
-        
-        let batteryView = BatteryView()
-        batteryView.heightAnchor.constraint(equalToConstant: 90).isActive = true
-        
-        let information = NSStackView()
-        information.heightAnchor.constraint(equalToConstant: 70).isActive = true
-        information.orientation = .vertical
-        information.spacing = 2
-        
-        var level: NSStackView {
-            let view = NSStackView()
-            view.orientation = .horizontal
-            view.alignment = .firstBaseline
-            view.spacing = -2
-            view.distribution = .fill
-            view.setHuggingPriority(.defaultLow, for: .horizontal)
-            
-            let value: NSTextField = ValueField("100")
-            value.font = .systemFont(ofSize: 28, weight: .medium)
-            value.textColor = .labelColor
-            self.levelField = value
-            
-            let percentage: NSTextField = LabelField("%")
-            percentage.font = .systemFont(ofSize: 16, weight: .medium)
-            percentage.textColor = .tertiaryLabelColor
-            
-            let leftSpacer = NSView()
-            let rightSpacer = NSView()
-            
-            view.addArrangedSubview(leftSpacer)
-            view.addArrangedSubview(value)
-            view.addArrangedSubview(percentage)
-            view.addArrangedSubview(rightSpacer)
-            
-            leftSpacer.widthAnchor.constraint(equalTo: rightSpacer.widthAnchor).isActive = true
-            
-            return view
-        }
-        
-        information.addArrangedSubview(level)
-        let batteryStatus = BatteryStatus()
-        information.addArrangedSubview(batteryStatus)
-        self.dashboardBatteryStatus = batteryStatus
-        
-        view.addArrangedSubview(batteryView)
-        self.dashboardBatteryView = batteryView
-        view.addArrangedSubview(information)
-        
-        return view
-    }
-    
-    private func initChart() -> NSView {
-        let view = NSStackView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: 0))
-        view.orientation = .vertical
-        view.spacing = 0
-        view.addArrangedSubview(SeparatorView(label: localizedString("Usage history")))
-        
-        let chart = BatteryChartView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: 90), history: self.chartHistory)
-        chart.layer?.backgroundColor = NSColor.lightGray.withAlphaComponent(0.1).cgColor
-        chart.layer?.cornerRadius = Constants.Popup.radius
-        chart.heightAnchor.constraint(equalToConstant: chart.frame.height).isActive = true
-        view.addArrangedSubview(chart)
-        chart.widthAnchor.constraint(equalTo: view.widthAnchor).isActive = true
-        self.chart = chart
-        
-        return view
-    }
-    
-    private func initDetails() -> NSView {
-        let view = NSStackView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: 0))
-        view.orientation = .vertical
-        view.spacing = 0
-        view.addArrangedSubview(SeparatorView(label: localizedString("Details")))
-        
-        self.sourceField = popupRow(view, title: "\(localizedString("Source")):", value: localizedString("Unknown")).1
-        
-        let time = popupRow(view, title: "\(localizedString("Time to discharge")):", value: localizedString("Unknown"))
-        self.timeLabelField = time.0
-        self.timeField = time.1
-        
-        return view
-    }
-    
-    private func initBattery() -> NSView {
-        let view = NSStackView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: 0))
-        view.orientation = .vertical
-        view.spacing = 0
-        view.addArrangedSubview(SeparatorView(label: localizedString("Battery")))
-        
-        let health: NSStackView = {
-            let view = NSStackView()
-            view.orientation = .vertical
-            view.spacing = 8
-            view.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 10, right: 0)
-            
-            let capacity: NSStackView = {
-                let rows = NSStackView()
-                rows.orientation = .vertical
-                rows.spacing = 0
-                rows.distribution = .fill
-                
-                let labels: NSStackView = {
-                    let row = NSStackView()
-                    row.orientation = .horizontal
-                    row.distribution = .fill
-                    row.spacing = 0
-                    
-                    let max = LabelField(localizedString("Max capacity"), size: 8)
-                    max.textColor = .tertiaryLabelColor
-                    let designed = LabelField(localizedString("Designed capacity"), size: 8)
-                    designed.textColor = .tertiaryLabelColor
-                    designed.alignment = .trailing
-                    
-                    row.addArrangedSubview(max)
-                    row.addArrangedSubview(NSView())
-                    row.addArrangedSubview(designed)
-                    
-                    return row
-                }()
-                
-                let values: NSStackView = {
-                    let row = NSStackView()
-                    row.orientation = .horizontal
-                    row.distribution = .fill
-                    row.spacing = 0
-                    
-                    let max = LabelField("0 mAh", size: 11)
-                    max.textColor = .secondaryLabelColor
-                    let designed = LabelField("0 mAh", size: 11)
-                    designed.textColor = .secondaryLabelColor
-                    designed.alignment = .trailing
-                    
-                    self.maxCapacityField = max
-                    self.designedCapacityField = designed
-                    
-                    row.addArrangedSubview(max)
-                    row.addArrangedSubview(NSView())
-                    row.addArrangedSubview(designed)
-                    
-                    return row
-                }()
-                
-                rows.addArrangedSubview(labels)
-                rows.addArrangedSubview(values)
-                
-                labels.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-                values.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
-                
-                return rows
-            }()
-            
-            view.addArrangedSubview(capacity)
-            let barView = BarChartView(size: 10, horizontal: true)
-            view.addArrangedSubview(barView)
-            self.barView = barView
-            
-            return view
-        }()
-        
-        view.addArrangedSubview(health)
-        
-        self.powerField = popupRow(view, title: "\(localizedString("Power")):", value: "0 W").1
-        self.currentField = popupRow(view, title: "\(localizedString("Current")):", value: "0 mA").1
-        self.voltageField = popupRow(view, title: "\(localizedString("Voltage")):", value: "0 V").1
-        self.healthField = popupRow(view, title: "\(localizedString("Health")):", value: "").1
-        self.cyclesField = popupRow(view, title: "\(localizedString("Cycles")):", value: "").1
-        self.temperatureField = popupRow(view, title: "\(localizedString("Temperature")):", value: "").1
-        
-        self.batterySection = view
-        
-        return view
-    }
-    
-    private func initAdapter() -> NSView {
-        let view = NSStackView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: 0))
-        view.orientation = .vertical
-        view.spacing = 0
-        view.addArrangedSubview(SeparatorView(label: localizedString("Power adapter")))
-        
-        self.chargingStateField = popupBadgeRow(view, title: "\(localizedString("Is charging")):", ok: "Yes", notOk: "No").1
-        self.adapterPowerField = popupRow(view, title: "\(localizedString("Power")):", value: "0 W").1
-        self.adapterCurrentField = popupRow(view, title: "\(localizedString("Current")):", value: "0 mA").1
-        self.adapterVoltageField = popupRow(view, title: "\(localizedString("Voltage")):", value: "0 V").1
-        
-        self.adapterView = view
-        
-        return view
-    }
-    
-    private func initProcesses() -> NSView {
-        if self.numberOfProcesses == 0 { return NSView() }
-        
-        let view: NSView = NSView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: self.processesHeight))
-        view.heightAnchor.constraint(equalToConstant: view.bounds.height).isActive = true
-        let separator = separatorView(localizedString("Top processes"), origin: NSPoint(x: 0, y: self.processesHeight-Constants.Popup.separatorHeight), width: self.frame.width)
-        let container: ProcessesView = ProcessesView(
-            frame: NSRect(x: 0, y: 0, width: self.frame.width, height: separator.frame.origin.y),
-            values: [(localizedString("Usage"), nil)],
-            n: self.numberOfProcesses
-        )
-        self.processes = container
-        
-        view.addSubview(separator)
-        view.addSubview(container)
-        
-        self.processesView = view
-        return view
-    }
-    
+
+    // MARK: - Usage
+
     public func usageCallback(_ value: Battery_Usage) {
         let date = Date()
-        self.apply(value, to: self.usageCache, render: self.renderUsage)
         DispatchQueue.main.async {
-            self.chartHistory.append(value.level, charging: value.isCharging, connected: !value.isBatteryPowered, at: date)
-            self.chart?.historyUpdated()
+            self.record(value, at: date)
+        }
+        self.apply(value, to: self.usageCache, render: self.renderUsage)
+    }
+
+    // the reader fires every few seconds: keep one point a minute, plus one when the charger is plugged or unplugged
+    private func record(_ value: Battery_Usage, at date: Date) {
+        let onAC = !value.isBatteryPowered
+        if let last = self.lastSampleAt, abs(date.timeIntervalSince(last)) < 60, self.lastSampleOnAC == onAC { return }
+        self.lastSampleAt = date
+        self.lastSampleOnAC = onAC
+        self.levelHistory.append(BatterySample(level: min(max(abs(value.level), 0), 1), onAC: onAC))
+    }
+
+    // one bar per point while they fit, then the whole history is squeezed into the width of the chart
+    private func historyBars() -> [BatterySample] {
+        let samples = self.levelHistory.values
+        let capacity = max(1, Int(self.contentWidth / (self.barWidth + self.barGap)))
+        guard samples.count > capacity else { return samples }
+
+        return (0..<capacity).map { i in
+            let from = i * samples.count / capacity
+            let to = max(from + 1, (i + 1) * samples.count / capacity)
+            let slice = samples[from..<to]
+            let level = slice.reduce(0) { $0 + $1.level } / Double(slice.count)
+            let onAC = slice.filter({ $0.onAC }).count * 2 >= slice.count
+            return BatterySample(level: level, onAC: onAC)
         }
     }
-    
-    private func renderUsage(_ value: Battery_Usage) {
-        self.dashboardBatteryView?.setValue(abs(value.level), connected: !value.isBatteryPowered, charging: value.isCharging)
-        self.dashboardBatteryStatus?.set(value)
-        
-        self.levelField?.stringValue = "\(Int(abs(value.level) * 100))"
-        self.levelField?.toolTip = "\(value.currentCapacity) mAh"
-        
-        self.sourceField?.stringValue = localizedString(value.powerSource)
-        
+
+    // h:mm left on battery or until the battery is full, nil when macOS has no estimate
+    private func shortTime(_ value: Battery_Usage) -> String? {
         if value.isBatteryPowered {
-            self.timeLabelField?.stringValue = "\(localizedString("Time to discharge")):"
-            if value.timeToEmpty != -1 && value.timeToEmpty != 0 {
-                self.timeField?.stringValue = Double(value.timeToEmpty*60).printSecondsToHoursMinutesSeconds(short: self.timeFormat == "short")
-            } else {
-                self.timeField?.stringValue = localizedString("Unknown")
-            }
-            
-            if self.adapterView != nil {
-                self.adapterView?.removeFromSuperview()
-                self.adapterView = nil
-                self.recalculateHeight()
-            }
+            guard value.timeToEmpty > 0 else { return nil }
+            return Double(value.timeToEmpty * 60).printSecondsToHoursMinutesSeconds(short: true)
+        }
+        guard !value.isCharged, !value.optimizedChargingEngaged, value.timeToCharge > 0 else { return nil }
+        return Double(value.timeToCharge * 60).printSecondsToHoursMinutesSeconds(short: true)
+    }
+
+    private func capacity(_ value: Int, row: ISRow?) {
+        // the reader falls back to 1 when the battery does not report a capacity
+        if value > 1 {
+            row?.set(NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal), unit: "mAh")
         } else {
-            self.timeLabelField?.stringValue = "\(localizedString("Time to charge")):"
-            if value.timeToCharge != -1 && value.timeToCharge != 0 {
-                self.timeField?.stringValue = Double(value.timeToCharge*60).printSecondsToHoursMinutesSeconds(short: self.timeFormat == "short")
-            } else {
-                self.timeField?.stringValue = localizedString("Unknown")
-            }
-            
-            if self.adapterView == nil {
-                var index: Int = 3
-                if let section = self.batterySection, let i = self.arrangedSubviews.firstIndex(of: section) {
-                    index = i + 1
-                }
-                self.insertArrangedSubview(self.initAdapter(), at: index)
-                self.recalculateHeight()
-            }
-            
-            self.chargingStateField?.setStatus(value.isCharging)
-            
-            var power: String = value.adapterPower > 0 ? "\(value.adapterPower.roundTo(decimalPlaces: 2)) W" : ""
-            if value.ACwatts > 0 {
-                power = power.isEmpty ? "\(value.ACwatts) W" : "\(power) / \(value.ACwatts) W"
-            }
-            self.adapterPowerField?.stringValue = power.isEmpty ? "0 W" : power
-            
-            let adapterCurrent = value.adapterVoltage > 0 ? Int((value.adapterPower / value.adapterVoltage) * 1000) : 0
-            self.adapterCurrentField?.stringValue = "\(adapterCurrent) mA"
-            self.adapterCurrentField?.toolTip = "\(localizedString("Charging")): \(value.chargingCurrent) mA"
-            self.adapterVoltageField?.stringValue = "\(value.adapterVoltage.roundTo(decimalPlaces: 2)) V"
-            self.adapterVoltageField?.toolTip = "\(localizedString("Charging")): \((Double(value.chargingVoltage)/1000).roundTo(decimalPlaces: 2)) V"
-        }
-        
-        self.powerField?.stringValue = "\(abs(value.batteryPower).roundTo(decimalPlaces: 2)) W"
-        self.currentField?.stringValue = "\(value.current) mA"
-        self.voltageField?.stringValue = "\(value.voltage.roundTo(decimalPlaces: 2)) V"
-        
-        if value.timeToEmpty == -1 || value.timeToCharge == -1 {
-            self.timeField?.stringValue = localizedString("Calculating")
-        }
-        if value.isCharged {
-            self.timeField?.stringValue = localizedString("Fully charged")
-        } else if value.optimizedChargingEngaged {
-            self.timeField?.stringValue = localizedString("On hold")
-        }
-        
-        self.barView?.setValue(ColorValue(Double(value.health)/100, color: .systemGreen))
-        self.maxCapacityField?.stringValue = "\(value.maxCapacity) mAh"
-        self.designedCapacityField?.stringValue = "\(value.designedCapacity) mAh"
-        
-        self.healthField?.stringValue = "\(value.health)%"
-        self.cyclesField?.stringValue = "\(value.cycles)"
-        if let value = value.temperature {
-            self.temperatureField?.stringValue = temperature(value)
-        } else {
-            self.temperatureField?.stringValue = localizedString("Unavailable")
+            row?.setPlain(localizedString("Unavailable"))
         }
     }
-    
+
+    private func renderUsage(_ value: Battery_Usage) {
+        let theme = ISTheme.current
+        let onAC = !value.isBatteryPowered
+        let level = min(max(abs(value.level), 0), 1)
+
+        // rings
+        let remaining = self.shortTime(value)
+        self.levelRing?.set(value: level, color: theme.blue)
+        self.levelRing?.setText(
+            "\(Int((level * 100).rounded()))",
+            unit: "%",
+            caption: remaining == nil ? localizedString("Battery") : nil,
+            symbol: onAC ? self.bolt : nil,
+            footer: remaining
+        )
+        self.levelRing?.toolTip = "\(value.currentCapacity) mAh"
+        self.healthRing?.set(value: Double(value.health) / 100, color: theme.pink)
+        self.healthRing?.setText("\(value.health)", unit: "%", caption: localizedString("Health"))
+
+        // history
+        let bars = self.historyBars()
+        self.chart?.set(bars.map { $0.onAC ? [$0.level, 0] : [0, $0.level] })
+        self.strip?.set(bars.map { $0.onAC })
+
+        // power adapter
+        if onAC {
+            var power = value.adapterPower > 0 ? isNumber(value.adapterPower, digits: 1) : ""
+            if value.ACwatts > 0 {
+                power = power.isEmpty ? "\(value.ACwatts)" : "\(power) / \(value.ACwatts)"
+            }
+            self.adapterPowerRow?.set(power.isEmpty ? "0" : power, unit: "W")
+            self.adapterPowerRow?.toolTip = value.adapterPower > 0 && value.ACwatts > 0
+                ? isL("Power drawn / adapter rating", fr: "Puissance fournie / puissance de l’adaptateur")
+                : nil
+
+            let amperage = value.adapterVoltage > 0 ? value.adapterPower / value.adapterVoltage : 0
+            self.adapterCurrentRow?.set(isNumber(amperage, digits: 2), unit: "A")
+            self.adapterCurrentRow?.toolTip = "\(localizedString("Charging")): \(value.chargingCurrent) mA"
+
+            let whole = value.adapterVoltage == value.adapterVoltage.rounded()
+            self.adapterVoltageRow?.set(isNumber(value.adapterVoltage, digits: whole ? 0 : 2), unit: "V")
+            self.adapterVoltageRow?.toolTip = "\(localizedString("Charging")): \(isNumber(Double(value.chargingVoltage) / 1000, digits: 2)) V"
+
+            self.chargingRow?.setPlain(localizedString(value.isCharging ? "Yes" : "No"))
+        }
+        if let card = self.adapterCard, card.isHidden == onAC {
+            card.isHidden = !onAC
+            self.resizeToFitContent()
+        }
+
+        // battery
+        self.powerRow?.set(isNumber(abs(value.batteryPower), digits: 1), unit: "W")
+        self.currentRow?.set(isNumber(Double(value.current) / 1000, digits: 2), unit: "A")
+        self.voltageRow?.set(isNumber(value.voltage, digits: 2), unit: "V")
+        if let degrees = value.temperature {
+            self.temperatureRow?.set(temperature(degrees))
+        } else {
+            self.temperatureRow?.setPlain(localizedString("Unavailable"))
+        }
+        self.sourceRow?.setPlain(localizedString(value.powerSource))
+
+        let minutes = onAC ? value.timeToCharge : value.timeToEmpty
+        var time = localizedString("Unknown")
+        if minutes == -1 {
+            time = localizedString("Calculating")
+        } else if minutes > 0 {
+            time = Double(minutes * 60).printSecondsToHoursMinutesSeconds(short: self.timeFormat == "short")
+        }
+        if onAC {
+            if value.isCharged {
+                // "Fully charged" does not fit next to the label
+                time = isL("Charged", fr: "Chargée")
+            } else if value.optimizedChargingEngaged {
+                time = localizedString("On hold")
+            }
+        }
+        self.timeRow?.labelField.stringValue = localizedString(onAC ? "Time to charge" : "Time to discharge")
+        self.timeRow?.setPlain(time)
+
+        // health
+        self.cyclesRow?.setPlain("\(value.cycles)")
+        self.capacity(value.designedCapacity, row: self.designCapacityRow)
+        self.capacity(value.maxCapacity, row: self.maxCapacityRow)
+        self.renderCondition()
+
+        // the energy mode is set per power source: read it again when the source changes, and from time to time
+        if let info = self.modeInfo, info.onBattery != value.isBatteryPowered {
+            self.refreshMode(force: true)
+        } else if let at = self.modeReadAt, Date().timeIntervalSince(at) > 30 {
+            self.refreshMode()
+        }
+    }
+
+    // MARK: - Battery condition
+
+    private func conditionName(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "good", "normal":
+            return localizedString("Normal")
+        case "fair":
+            return isL("Fair", fr: "Correct")
+        case "poor":
+            return isL("Poor", fr: "Mauvais")
+        case "check battery", "service battery", "service recommended", "replace soon", "replace now":
+            return isL("Service Recommended", fr: "Réparation recommandée")
+        default:
+            return localizedString(raw)
+        }
+    }
+
+    private func renderCondition() {
+        guard let raw = self.usageCache.value?.state ?? self.condition else { return }
+        self.conditionRow?.setPlain(self.conditionName(raw))
+    }
+
+    // system_profiler is slow (0.2 s): background queue, at most every 30 minutes
+    private func refreshCondition() {
+        guard self.usageCache.value?.state == nil, !self.conditionReading else { return }
+        if let at = self.conditionReadAt, Date().timeIntervalSince(at) < 1800 { return }
+
+        self.conditionReading = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let value = PowerTools.batteryCondition()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.conditionReading = false
+                self.conditionReadAt = Date()
+                if let value {
+                    self.condition = value
+                }
+                self.renderCondition()
+            }
+        }
+    }
+
+    // MARK: - Energy mode
+
+    // the full name when it fits next to the title, a short one otherwise
+    private func modeLabel(_ mode: Int) -> String {
+        let name = PowerTools.modeName(mode)
+        let needed = self.modeTitle.uppercased().widthOfString(usingFont: ISFont.label(13)) + name.widthOfString(usingFont: ISFont.value(13))
+        return needed + 14 <= self.contentWidth ? name : PowerTools.shortModeName(mode)
+    }
+
+    private func sourceName(onBattery: Bool) -> String {
+        onBattery ? localizedString("On battery") : isL("On power adapter", fr: "Sur adaptateur secteur")
+    }
+
+    private func renderMode() {
+        guard let card = self.modeCard else { return }
+
+        let hidden = self.modeReadAt != nil && self.modeInfo == nil
+        if card.isHidden != hidden {
+            card.isHidden = hidden
+            self.resizeToFitContent()
+        }
+
+        guard let info = self.modeInfo else {
+            card.valueField?.stringValue = "—"
+            card.toolTip = nil
+            return
+        }
+        card.valueField?.stringValue = self.modeLabel(info.current)
+        card.toolTip = "\(PowerTools.modeName(info.current)) (\(self.sourceName(onBattery: info.onBattery)))"
+    }
+
+    private func refreshMode(force: Bool = false) {
+        if self.modeReading {
+            if force { self.modeReadAgain = true }
+            return
+        }
+
+        self.modeReading = true
+        let onBattery = self.usageCache.value?.isBatteryPowered
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let info = PowerTools.readMode(onBattery: onBattery)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.modeReading = false
+                self.modeReadAt = Date()
+                self.modeInfo = info
+                self.renderMode()
+                if self.modeReadAgain {
+                    self.modeReadAgain = false
+                    self.refreshMode()
+                }
+            }
+        }
+    }
+
+    private func showModeMenu() {
+        guard let card = self.modeCard, !self.modeChanging else { return }
+        guard let info = self.modeInfo, info.modes.count > 1 else {
+            self.refreshMode()
+            return
+        }
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        // the mode is changed for the power source in use
+        let onBattery = self.usageCache.value?.isBatteryPowered ?? info.onBattery
+        let header = NSMenuItem(title: self.sourceName(onBattery: onBattery), action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        for mode in info.modes {
+            let item = NSMenuItem(title: PowerTools.modeName(mode), action: #selector(self.selectMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = mode
+            item.state = onBattery == info.onBattery && mode == info.current ? .on : .off
+            menu.addItem(item)
+        }
+
+        menu.minimumWidth = card.bounds.width
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: -4), in: card)
+    }
+
+    @objc private func selectMode(_ sender: NSMenuItem) {
+        guard let info = self.modeInfo, !self.modeChanging, info.modes.contains(sender.tag) else { return }
+        let onBattery = self.usageCache.value?.isBatteryPowered ?? info.onBattery
+        if onBattery == info.onBattery && sender.tag == info.current { return }
+
+        let mode = sender.tag
+        let key = info.key
+        self.modeChanging = true
+        // pmset needs root: this may show the administrator password dialog, so never on the main thread
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = PowerTools.writeMode(mode, key: key, onBattery: onBattery)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.modeChanging = false
+                self.refreshMode(force: true)
+            }
+        }
+    }
+
+    // MARK: - Processes
+
     public func processCallback(_ list: [TopProcess]) {
         self.apply(list, to: self.processesCache, render: self.renderProcesses)
     }
-    
+
     private func renderProcesses(_ list: [TopProcess]) {
-        if list.count != self.processes?.count { self.processes?.clear() }
-        
-        for i in 0..<list.count {
-            let process = list[i]
-            self.processes?.set(i, process, ["\(process.usage)%"])
+        if let processes = self.processes {
+            let n = min(list.count, processes.count)
+            for i in 0..<n {
+                // the power column of top: an energy impact figure, it has no unit
+                processes.set(i, list[i], [isNumber(list[i].usage, digits: 1)])
+            }
+            processes.clear(from: n)
+        }
+        self.renderSignificant(list)
+    }
+
+    private func parentPID(_ pid: pid_t) -> pid_t? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info.kp_eproc.e_ppid
+    }
+
+    // the app a process is shown under: itself or the closest parent that is a regular app (a shell command
+    // counts for its terminal, a browser helper for its browser), else the outermost menu bar or background app
+    private func owningApp(of pid: Int) -> NSRunningApplication? {
+        if let cached = self.ownerCache[pid] {
+            return cached > 0 ? NSRunningApplication(processIdentifier: cached) : nil
+        }
+
+        var owner: NSRunningApplication? = nil
+        var current = pid_t(pid)
+        for _ in 0..<12 {
+            if let app = NSRunningApplication(processIdentifier: current) {
+                if app.activationPolicy == .regular {
+                    owner = app
+                    break
+                }
+                if app.bundleURL?.pathExtension == "app" {
+                    owner = app
+                }
+            }
+            guard let parent = self.parentPID(current), parent > 1, parent != current else { break }
+            current = parent
+        }
+
+        self.ownerCache[pid] = owner?.processIdentifier ?? 0
+        return owner
+    }
+
+    // names only, as in iStat Menus: the apps whose processes add up to a significant energy impact
+    private func renderSignificant(_ list: [TopProcess]) {
+        guard let rows = self.significantApps, let none = self.significantNone else { return }
+
+        var apps: [pid_t: NSRunningApplication] = [:]
+        var usage: [pid_t: Double] = [:]
+        for process in list where process.usage > 0 {
+            guard let app = self.owningApp(of: process.pid) else { continue }
+            apps[app.processIdentifier] = app
+            usage[app.processIdentifier, default: 0] += process.usage
+        }
+        let significant = usage.filter({ $0.value >= self.significantPower }).sorted(by: { $0.value > $1.value }).prefix(rows.count)
+
+        for (i, item) in significant.enumerated() {
+            let app = apps[item.key]
+            rows.set(i, icon: app?.icon, name: app?.localizedName ?? "", values: [])
+        }
+
+        var resized = false
+        for (i, row) in rows.arrangedSubviews.enumerated() where row.isHidden != (i >= significant.count) {
+            row.isHidden = i >= significant.count
+            resized = true
+        }
+        if rows.isHidden != significant.isEmpty {
+            rows.isHidden = significant.isEmpty
+            resized = true
+        }
+        if none.isHidden == significant.isEmpty {
+            none.isHidden = !significant.isEmpty
+            resized = true
+        }
+        if resized {
+            self.resizeToFitContent()
         }
     }
-    
+
     public func numberOfProcessesUpdated() {
-        if self.processes?.count == self.numberOfProcesses { return }
-        
-        DispatchQueue.main.async(execute: {
-            guard self.contentLoaded else { return }
-            self.processesView?.removeFromSuperview()
-            self.processesView = nil
-            self.processes = nil
-            self.addArrangedSubview(self.initProcesses())
+        DispatchQueue.main.async {
+            guard self.contentLoaded, self.processes?.count != self.numberOfProcesses else { return }
+            self.releaseContent()
             self.processesCache.initialized = false
-            self.recalculateHeight()
-        })
+            self.prepareForDisplay()
+        }
     }
-    
+
     // MARK: - Settings
-    
+
     public override func settings() -> NSView? {
         let view = SettingsContainerView()
-        
+
         view.addArrangedSubview(PreferencesSection([
             PreferencesRow(localizedString("Keyboard shortcut"), component: KeyboardShartcutView(
                 callback: self.setKeyboardShortcut,
                 value: self.keyboardShortcut
             ))
         ]))
-        
+
         return view
+    }
+}
+
+// thin strip under the level history: one blue segment for each period spent on the power adapter
+private final class BatterySourceStrip: NSView {
+    var barWidth: CGFloat = 2
+    var gap: CGFloat = 1
+
+    private var states: [Bool] = []
+    private let thickness: CGFloat = 8
+    private let bolt = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)
+
+    init(height: CGFloat) {
+        super.init(frame: .zero)
+        self.translatesAutoresizingMaskIntoConstraints = false
+        self.heightAnchor.constraint(equalToConstant: height).isActive = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func set(_ states: [Bool]) {
+        self.states = states
+        self.needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let step = self.barWidth + self.gap
+        let capacity = Int(self.bounds.width / step)
+        guard capacity > 0, !self.states.isEmpty else { return }
+
+        let theme = ISTheme.current
+        let visible = Array(self.states.suffix(capacity))
+        // same geometry as ISBarChart: the newest value is the last bar on the right
+        let origin = self.bounds.width - self.barWidth - (CGFloat(visible.count - 1) * step)
+        let y = ((self.bounds.height - self.thickness) / 2).rounded()
+
+        var first: Int? = nil
+        var bolts: [CGFloat] = []
+        theme.blue.setFill()
+        for i in 0...visible.count {
+            if i < visible.count && visible[i] {
+                if first == nil { first = i }
+                continue
+            }
+            guard let start = first else { continue }
+            first = nil
+
+            let x = origin + (CGFloat(start) * step)
+            let width = (CGFloat(i - start) * step) - self.gap
+            let radius = min(2.5, width / 2)
+            NSBezierPath(roundedRect: NSRect(x: x, y: y, width: width, height: self.thickness), xRadius: radius, yRadius: radius).fill()
+            // a bolt on the long periods only
+            if width >= 24 { bolts.append(x + (width / 2)) }
+        }
+
+        bolts.forEach { self.drawBolt(at: $0, outline: theme.background, color: theme.value) }
+    }
+
+    // white bolt with a thin outline in the background colour
+    private func drawBolt(at x: CGFloat, outline: NSColor, color: NSColor) {
+        guard let bolt = self.bolt, bolt.size.height > 0 else { return }
+
+        let height = self.bounds.height - 2
+        let width = height * (bolt.size.width / bolt.size.height)
+        let rect = NSRect(x: (x - (width / 2)).rounded(), y: 1, width: width, height: height)
+
+        let shadow = self.tinted(bolt, outline)
+        let offsets: [(CGFloat, CGFloat)] = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]
+        for (dx, dy) in offsets {
+            shadow.draw(in: rect.offsetBy(dx: dx, dy: dy))
+        }
+        self.tinted(bolt, color).draw(in: rect)
+    }
+
+    private func tinted(_ image: NSImage, _ color: NSColor) -> NSImage {
+        NSImage(size: image.size, flipped: false) { rect in
+            image.draw(in: rect)
+            color.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+    }
+}
+
+// MARK: - Command line tools (they block: never call them on the main thread)
+
+private struct PowerModeInfo {
+    let key: String      // "powermode", or "lowpowermode" on Macs that only know on and off
+    let current: Int     // 0 automatic, 1 low power, 2 high power
+    let modes: [Int]     // what can be chosen for the power source in use
+    let onBattery: Bool
+}
+
+private enum PowerTools {
+    static func modeName(_ mode: Int) -> String {
+        switch mode {
+        case 1: return isL("Low Power", fr: "Économie d’énergie")
+        case 2: return isL("High Power", fr: "Haute performance")
+        default: return localizedString("Automatic")
+        }
+    }
+
+    static func shortModeName(_ mode: Int) -> String {
+        switch mode {
+        case 1: return isL("Low Power", fr: "Économie")
+        case 2: return isL("High Power", fr: "Performance")
+        default: return localizedString("Automatic")
+        }
+    }
+
+    // `pmset -g` prints the settings of the power source in use
+    static func readMode(onBattery known: Bool?) -> PowerModeInfo? {
+        guard let settings = self.run("/usr/bin/pmset", ["-g"]), settings.status == 0 else { return nil }
+
+        var values: [String: Int] = [:]
+        settings.output.enumerateLines { line, _ in
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 2, let value = Int(parts[1]) else { return }
+            values[String(parts[0])] = value
+        }
+
+        let onBattery = known ?? (self.run("/usr/bin/pmset", ["-g", "ps"])?.output.contains("'Battery Power'") ?? false)
+
+        if let current = values["powermode"] {
+            // high power only where the Mac lists it for this power source
+            let capabilities = self.run("/usr/bin/pmset", ["-g", "cap"])?.output ?? ""
+            let highPower = capabilities.contains("highpowermode") || current == 2
+            return PowerModeInfo(key: "powermode", current: current, modes: highPower ? [0, 1, 2] : [0, 1], onBattery: onBattery)
+        }
+        if let current = values["lowpowermode"] {
+            return PowerModeInfo(key: "lowpowermode", current: current == 0 ? 0 : 1, modes: [0, 1], onBattery: onBattery)
+        }
+        return nil
+    }
+
+    // pmset needs root to write: sudo without a password first (works with a sudoers rule),
+    // otherwise macOS asks for an administrator password
+    static func writeMode(_ mode: Int, key: String, onBattery: Bool) -> Bool {
+        // every word of the command comes from these fixed lists, nothing from outside
+        guard ["powermode", "lowpowermode"].contains(key), (0...(key == "powermode" ? 2 : 1)).contains(mode) else { return false }
+        let arguments = [onBattery ? "-b" : "-c", key, "\(mode)"]
+
+        if let result = self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset"] + arguments), result.status == 0 {
+            return true
+        }
+
+        let prompt = isL("Stats wants to change the energy mode.", fr: "Stats veut changer le mode d’énergie.")
+        let script = "do shell script \"/usr/bin/pmset \(arguments.joined(separator: " "))\" with prompt \"\(prompt)\" with administrator privileges"
+        return self.run("/usr/bin/osascript", ["-e", script])?.status == 0
+    }
+
+    // "Good", "Fair", "Poor"… as shown in System Information
+    static func batteryCondition() -> String? {
+        guard let result = self.run("/usr/sbin/system_profiler", ["SPPowerDataType", "-json"]), result.status == 0,
+              let data = result.output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sections = json["SPPowerDataType"] as? [[String: Any]] else { return nil }
+
+        for section in sections {
+            if let health = section["sppower_battery_health_info"] as? [String: Any],
+               let condition = health["sppower_battery_health"] as? String, !condition.isEmpty {
+                return condition
+            }
+        }
+        return nil
+    }
+
+    private static func run(_ path: String, _ arguments: [String]) -> (status: Int32, output: String)? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: path)
+        task.arguments = arguments
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        task.standardInput = FileHandle.nullDevice
+
+        do {
+            try task.run()
+        } catch {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        return (task.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
 }
 
@@ -608,87 +1076,5 @@ internal class BatteryView: NSView {
         let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
         image?.isTemplate = false
         return image
-    }
-}
-
-internal class BatteryStatus: NSStackView {
-    private var view: NSView? = nil
-    private var icon: NSImageView? = nil
-    private var field: NSTextField? = nil
-    
-    public override init(frame: NSRect = NSRect.zero) {
-        super.init(frame: frame)
-        
-        self.orientation = .horizontal
-        self.alignment = .firstBaseline
-        self.spacing = 0
-        self.distribution = .fill
-        self.setHuggingPriority(.defaultLow, for: .horizontal)
-        
-        let block = NSStackView()
-        block.orientation = .horizontal
-        block.alignment = .centerY
-        block.spacing = 4
-        block.translatesAutoresizingMaskIntoConstraints = false
-        block.wantsLayer = true
-        block.layer?.backgroundColor = NSColor.systemGray.withAlphaComponent(0.18).cgColor
-        block.layer?.cornerRadius = 8
-        block.edgeInsets = NSEdgeInsets(top: 3, left: 7, bottom: 3, right: 7)
-        self.view = block
-        
-        let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: localizedString("Unknown"))
-        icon.contentTintColor = .systemGray
-        icon.symbolConfiguration = .init(pointSize: 10, weight: .bold)
-        icon.isHidden = true
-        self.icon = icon
-        
-        let label = NSTextField(labelWithString: localizedString("Unknown"))
-        label.font = .systemFont(ofSize: 11, weight: .bold)
-        label.textColor = .systemGray
-        self.field = label
-        
-        block.addArrangedSubview(icon)
-        block.addArrangedSubview(label)
-        
-        let leftSpacer = NSView()
-        let rightSpacer = NSView()
-        
-        self.addArrangedSubview(leftSpacer)
-        self.addArrangedSubview(block)
-        self.addArrangedSubview(rightSpacer)
-        
-        leftSpacer.widthAnchor.constraint(equalTo: rightSpacer.widthAnchor).isActive = true
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    public func set(_ value: Battery_Usage) {
-        var text: String = localizedString("Charging")
-        var color: NSColor = .systemGreen
-        var symbol: String = "bolt.fill"
-        
-        if value.isBatteryPowered {
-            text = localizedString("On battery")
-            color = value.level > 0.15 ? .systemGray : .systemRed
-        } else if !value.isCharging {
-            if value.isCharged && value.level >= 1 {
-                text = localizedString("Plugged in")
-                symbol = "powerplug.fill"
-            } else if value.optimizedChargingEngaged {
-                text = localizedString("On hold")
-                color = .systemGray
-                symbol = "powerplug.fill"
-            }
-        }
-        
-        self.icon?.isHidden = value.isBatteryPowered
-        self.icon?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: text)
-        self.icon?.contentTintColor = color
-        self.field?.textColor = color
-        self.field?.stringValue = text
-        self.view?.layer?.backgroundColor = color.withAlphaComponent(0.18).cgColor
     }
 }

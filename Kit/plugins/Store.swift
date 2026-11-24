@@ -22,9 +22,24 @@ public class Store {
     }
     
     private func loadCache() {
-        guard let bundleId = Bundle.main.bundleIdentifier,
-              let domain = self.defaults.persistentDomain(forName: bundleId) else { return }
-        self.cache = domain
+        if let bundleId = Bundle.main.bundleIdentifier,
+           let domain = self.defaults.persistentDomain(forName: bundleId) {
+            self.cache = domain
+        }
+        
+        // STATS_DEBUG_OVERRIDES="Key=value;Other=value": settings for one test run, kept in memory only
+        guard let raw = ProcessInfo.processInfo.environment["STATS_DEBUG_OVERRIDES"] else { return }
+        for pair in raw.split(separator: ";") {
+            let parts = pair.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            if parts[1] == "true" || parts[1] == "false" {
+                self.cache[parts[0]] = parts[1] == "true"
+            } else if let number = Int(parts[1]) {
+                self.cache[parts[0]] = number
+            } else {
+                self.cache[parts[0]] = parts[1]
+            }
+        }
     }
     
     private func getValue<T>(for key: String, type: T.Type) -> T? {

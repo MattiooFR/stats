@@ -13,214 +13,352 @@ import Cocoa
 import Kit
 
 internal class Popup: PopupWrapper {
-    private var chartHistory: [String: NetworkChartData] = [:]
+    // (read, write) per tick, summed over all the disks, drawn as a mirror chart
+    private let activityHistory = ISHistory<(Double, Double)>(capacity: 160)
+    
+    // cards that depend on the list of mounted volumes, always at the top of the popup
+    private var volumeSections: [NSView] = []
+    private var volumeSignature: [String] = []
+    private var diskCards: [DiskCard] = []
+    private var networkRows: [DiskVolumeRow] = []
+    private var removableRows: [DiskVolumeRow] = []
+    
+    private var readValue: ISBigValue? = nil
+    private var writeValue: ISBigValue? = nil
+    private var chart: ISMirrorChart? = nil
+    private var peaks: DiskPeakRow? = nil
+    private var processes: ISProcessList? = nil
+    
+    private let processesCache = PopupCache<[Disk_process]>()
+    private let activityCache = PopupCache<DiskActivity>()
+    
+    private var capacity: Disks?
+    private var smartValues: [String: smart_t] = [:]
+    // network volumes are not known by the readers (no BSD name, mounted outside of /Volumes)
+    private var remoteVolumes: [DiskVolume] = []
+    private var remoteRefreshing: Bool = false
+    
+    private var settingsLoaded: Bool = false
+    private let settingsSection = PreferencesSection(title: localizedString("Drives"))
+    private var lastList: [String] = []
+    
+    // not used by the popup anymore, still read by the widgets, the portal and the preview
     private var mainColorState: SColor = .secondBlue
-    private var mainColor: NSColor { self.mainColorState.additional as? NSColor ?? NSColor.systemBlue }
     private var readColorState: SColor = .secondBlue
-    private var readColor: NSColor { self.readColorState.additional as? NSColor ?? NSColor.systemRed }
     private var writeColorState: SColor = .secondRed
-    private var writeColor: NSColor { self.writeColorState.additional as? NSColor ?? NSColor.systemBlue }
     private var reverseOrderState: Bool = false
+    
     private var base: DataSizeBase {
         DataSizeBase(rawValue: Store.shared.string(key: "\(self.title)_base", defaultValue: DataSizeBase.byte.rawValue)) ?? .byte
     }
     private var speedUnit: String {
         networkSpeedUnit(from: Store.shared.string(key: "\(self.title)_speedUnit", defaultValue: NetworkSpeedUnitAuto)).key
     }
-    
-    private var disks: NSStackView = {
-        let view = NSStackView()
-        view.spacing = Constants.Popup.margins
-        view.orientation = .vertical
-        return view
-    }()
-    
-    private let processesCache = PopupCache<[Disk_process]>()
-    private var capacity: Disks?
-    private var activity: Disks?
-    private var settingsLoaded: Bool = false
-    
     private var numberOfProcesses: Int {
-        Store.shared.int(key: "\(self.title)_processes", defaultValue: 8)
+        Store.shared.int(key: "\(self.title)_processes", defaultValue: 5)
     }
-    private var processesHeight: CGFloat {
-        (22*CGFloat(self.numberOfProcesses)) + (self.numberOfProcesses == 0 ? 0 : Constants.Popup.separatorHeight + 22)
-    }
-    private var processes: ProcessesView? = nil
-    private var processesView: NSView? = nil
-    
-    private let settingsSection = PreferencesSection(title: localizedString("Drives"))
-    private var lastList: [String] = []
-    private var smartValues: [String: smart_t] = [:]
     
     public init(_ module: ModuleType) {
-        super.init(module, frame: NSRect(x: 0, y: 0, width: Constants.Popup.width, height: 0))
+        super.init(module, frame: NSRect(x: 0, y: 0, width: 285, height: 0))
         
         self.mainColorState = SColor.fromString(Store.shared.string(key: "\(self.title)_mainColor", defaultValue: self.mainColorState.key))
         self.readColorState = SColor.fromString(Store.shared.string(key: "\(self.title)_readColor", defaultValue: self.readColorState.key))
         self.writeColorState = SColor.fromString(Store.shared.string(key: "\(self.title)_writeColor", defaultValue: self.writeColorState.key))
         self.reverseOrderState = Store.shared.bool(key: "\(self.title)_reverseOrder", defaultValue: self.reverseOrderState)
         
+        self.spacing = ISMetrics.spacing
         self.orientation = .vertical
-        self.distribution = .fill
-        self.spacing = 0
-    }
-    
-    public override func loadContent() {
-        self.addArrangedSubview(self.disks)
-        self.addArrangedSubview(self.initProcesses())
-        if let capacity = self.capacity { self.capacityCallback(capacity) }
-        self.recalculateHeight()
-    }
-    
-    public override func unloadContent() {
-        self.disks.subviews.forEach { $0.removeFromSuperview() }
-        self.processes = nil
-        self.processesView = nil
-    }
-    
-    public override func disappear() {
-        self.processes?.setLock(false)
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
-    private func recalculateHeight() {
-        var h: CGFloat = 0
-        h += self.disks.subviews.map({ $0.frame.height + self.disks.spacing }).reduce(0, +) - self.disks.spacing
-        h += self.processesHeight
-        if h > 0 && self.frame.size.height != h {
-            self.setFrameSize(NSSize(width: self.frame.width, height: h))
-            self.sizeCallback?(self.frame.size)
+    public override func loadContent() {
+        self.addSection(self.initActivity())
+        if self.numberOfProcesses > 0 {
+            self.addSection(self.initProcesses())
         }
+        self.addSection(ISShortcutBar(module: .disk, extra: [ISShortcut.app("com.apple.DiskUtility")]))
+        
+        // the disk cards are inserted above, they follow what is mounted
+        self.refreshRemoteVolumes()
+        self.renderVolumes()
+        
+        self.resizeToFitContent()
+    }
+    
+    public override func unloadContent() {
+        self.volumeSections = []
+        self.volumeSignature = []
+        self.diskCards = []
+        self.networkRows = []
+        self.removableRows = []
+        self.readValue = nil
+        self.writeValue = nil
+        self.chart = nil
+        self.peaks = nil
+        self.processes = nil
+    }
+    
+    public override func appear() {
+        guard self.contentLoaded else { return }
+        self.renderVolumes()
+        self.replay(self.activityCache, render: self.renderActivity)
+        self.replay(self.processesCache, render: self.renderProcesses)
+    }
+    
+    // MARK: - Views
+    
+    private func initActivity() -> NSView {
+        let theme = ISTheme.current
+        let card = ISCard()
+        
+        let read = ISBigValue(caption: localizedString("Read"), color: theme.pink)
+        let write = ISBigValue(caption: localizedString("Write"), color: theme.blue)
+        let values = NSView()
+        values.translatesAutoresizingMaskIntoConstraints = false
+        values.addSubview(read)
+        values.addSubview(write)
+        NSLayoutConstraint.activate([
+            read.leadingAnchor.constraint(equalTo: values.leadingAnchor),
+            read.topAnchor.constraint(equalTo: values.topAnchor),
+            read.bottomAnchor.constraint(equalTo: values.bottomAnchor),
+            read.widthAnchor.constraint(equalTo: values.widthAnchor, multiplier: 0.5),
+            write.trailingAnchor.constraint(equalTo: values.trailingAnchor),
+            write.topAnchor.constraint(equalTo: values.topAnchor),
+            write.bottomAnchor.constraint(equalTo: values.bottomAnchor),
+            write.widthAnchor.constraint(equalTo: read.widthAnchor)
+        ])
+        card.add(values, spacingAfter: 4)
+        self.readValue = read
+        self.writeValue = write
+        
+        let chart = ISMirrorChart(up: theme.pink, down: theme.blue, height: 60)
+        card.add(chart, spacingAfter: 2)
+        self.chart = chart
+        
+        let peaks = DiskPeakRow(read: localizedString("Read"), write: localizedString("Write"))
+        card.add(peaks)
+        self.peaks = peaks
+        
+        return card
     }
     
     private func initProcesses() -> NSView {
-        if self.numberOfProcesses == 0 {
-            let v = NSView()
-            self.processesView = v
-            return v
+        let width: CGFloat = 60
+        let card = ISCard(title: isL("Processes", fr: "Processus"))
+        card.setHeaderColumns(["R", "W"], width: width)
+        let list = ISProcessList(n: self.numberOfProcesses, columns: 2, columnWidth: width)
+        card.add(list)
+        self.processes = list
+        return card
+    }
+    
+    private func initVolumes(_ title: String, _ volumes: [DiskVolume]) -> (ISCard, [DiskVolumeRow]) {
+        let card = ISCard(title: title)
+        let rows = volumes.map { DiskVolumeRow($0) }
+        rows.forEach { card.add($0) }
+        return (card, rows)
+    }
+    
+    // MARK: - Volumes
+    
+    private func volumeState(_ id: String) -> Bool {
+        Store.shared.bool(key: "\(self.title)_\(id)_popup", defaultValue: true)
+    }
+    
+    // main disks get a card with a ring, network and removable volumes a row with a bar
+    private func volumeLayout() -> (disks: [drive], network: [DiskVolume], removable: [DiskVolume]) {
+        var disks: [drive] = []
+        var removable: [DiskVolume] = []
+        let known = self.capacity?.array ?? []
+        
+        known.filter({ $0.popupState }).forEach { d in
+            if !d.root && (d.removable || d.connectionType == "Disk Image") {
+                removable.append(DiskVolume(d))
+            } else {
+                disks.append(d)
+            }
+        }
+        let paths = Set(known.compactMap { $0.path?.path })
+        let network = self.remoteVolumes.filter { v in
+            self.volumeState(v.id) && !paths.contains(v.path?.path ?? "")
         }
         
-        let view: NSView = NSView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: self.processesHeight))
-        let separator = separatorView(localizedString("Top processes"), origin: NSPoint(x: 0, y: self.processesHeight-Constants.Popup.separatorHeight), width: self.frame.width)
-        let container: ProcessesView = ProcessesView(
-            frame: NSRect(x: 0, y: 0, width: self.frame.width, height: separator.frame.origin.y),
-            values: [(localizedString("Read"), self.readColor), (localizedString("Write"), self.writeColor)],
-            n: self.numberOfProcesses
-        )
-        self.processes = container
-        view.addSubview(separator)
-        view.addSubview(container)
-        self.processesView = view
-        return view
+        return (disks, network, removable)
     }
     
-    // MARK: - callbacks
-    
-    public override func appear() {
-        self.replay(self.processesCache, render: self.renderProcesses)
-        self.disks.subviews.compactMap { $0 as? DiskView }.forEach { $0.appear() }
+    private func renderVolumes() {
+        guard self.contentLoaded else { return }
+        let layout = self.volumeLayout()
+        let signature = layout.disks.map({ "disk:\($0.uuid)" }) + layout.network.map({ "network:\($0.id)" }) + layout.removable.map({ "removable:\($0.id)" })
+        
+        var rebuilt = false
+        if signature != self.volumeSignature {
+            self.volumeSections.forEach { view in
+                self.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            self.diskCards = layout.disks.map { DiskCard($0) }
+            var sections: [NSView] = self.diskCards
+            if layout.network.isEmpty {
+                self.networkRows = []
+            } else {
+                let (card, rows) = self.initVolumes(isL("Network disks", fr: "Disque réseau"), layout.network)
+                sections.append(card)
+                self.networkRows = rows
+            }
+            if layout.removable.isEmpty {
+                self.removableRows = []
+            } else {
+                let (card, rows) = self.initVolumes(isL("Removable volumes", fr: "Volumes amovibles"), layout.removable)
+                sections.append(card)
+                self.removableRows = rows
+            }
+            sections.enumerated().forEach { self.addSection($0.element, at: $0.offset) }
+            self.volumeSections = sections
+            self.volumeSignature = signature
+            rebuilt = true
+        }
+        
+        zip(self.diskCards, layout.disks).forEach { $0.update($1, toolTip: self.details($1)) }
+        zip(self.networkRows, layout.network).forEach { $0.update($1) }
+        zip(self.removableRows, layout.removable).forEach { $0.update($1) }
+        if let activity = self.activityCache.value {
+            self.renderDots(activity)
+        }
+        
+        if rebuilt {
+            self.resizeToFitContent()
+        }
     }
+    
+    private func details(_ d: drive) -> String {
+        let colon = isL(":", fr: " :")
+        let unknown = localizedString("Unknown")
+        var lines: [String] = [
+            d.mediaName,
+            localizedString("Free disk memory", diskSize(d.free), diskSize(d.size)),
+            "\(localizedString("File system"))\(colon) \(d.fileSystem.isEmpty ? unknown : d.fileSystem.uppercased())",
+            "\(localizedString("Connection type"))\(colon) \(d.connectionType.isEmpty ? unknown : d.connectionType)"
+        ]
+        
+        if let activity = self.activityCache.value?.drives[d.uuid], activity.readBytes != 0 || activity.writeBytes != 0 {
+            lines.append("\(localizedString("Total read"))\(colon) \(diskSize(activity.readBytes))")
+            lines.append("\(localizedString("Total written"))\(colon) \(diskSize(activity.writeBytes))")
+        }
+        
+        if let smart = self.smartValues[d.uuid] {
+            lines.append("")
+            lines.append("SMART")
+            lines.append("\(localizedString("Temperature"))\(colon) \(temperature(Double(smart.temperature)))")
+            lines.append("\(localizedString("Health"))\(colon) \(smart.life)%")
+            lines.append("\(localizedString("Total read"))\(colon) \(diskSize(smart.totalRead))")
+            lines.append("\(localizedString("Total written"))\(colon) \(diskSize(smart.totalWritten))")
+            lines.append("\(localizedString("Power cycles"))\(colon) \(smart.powerCycles)")
+            lines.append("\(localizedString("Power on hours"))\(colon) \(smart.powerOnHours)")
+            if let warning = smart.criticalWarning {
+                let list = smartCriticalWarnings(warning)
+                lines.append("\(localizedString("Critical warning"))\(colon) \(list.isEmpty ? localizedString("None") : list.joined(separator: ", "))")
+            }
+            if let spare = smart.availableSpare {
+                var line = "\(localizedString("Available spare"))\(colon) \(spare)%"
+                if let threshold = smart.spareThreshold {
+                    line += " (\(localizedString("Threshold"))\(colon) \(threshold)%)"
+                }
+                lines.append(line)
+            }
+        }
+        
+        return lines.joined(separator: "\n")
+    }
+    
+    // lists the network volumes without waiting for them, then asks each one for fresh numbers in the background
+    private func refreshRemoteVolumes() {
+        self.remoteVolumes = DiskVolume.remote()
+        guard self.contentLoaded, !self.remoteRefreshing, !self.remoteVolumes.isEmpty else { return }
+        
+        self.remoteRefreshing = true
+        let paths = self.remoteVolumes.compactMap { $0.path?.path }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            // the kernel keeps the answer and the next listing reads it; a server that does not answer only blocks this task
+            paths.forEach { path in
+                var stat = statfs()
+                _ = statfs(path, &stat)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.remoteRefreshing = false
+                self.remoteVolumes = DiskVolume.remote()
+                self.renderVolumes()
+            }
+        }
+    }
+    
+    // MARK: - Callbacks
     
     internal func capacityCallback(_ value: Disks) {
         self.capacity = value
-        let keys = Set(value.array.map { $0.uuid })
-        self.chartHistory = self.chartHistory.filter { keys.contains($0.key) }
-        if self.settingsLoaded { self.updateSettings(value) }
-        guard self.contentLoaded else { return }
-        defer {
-            let h = self.disks.subviews.map({ $0.bounds.height + self.disks.spacing }).reduce(0, +) - self.disks.spacing
-            if h > 0 && self.disks.frame.size.height != h {
-                self.disks.setFrameSize(NSSize(width: self.frame.width, height: h))
-                self.recalculateHeight()
-            } else if h < 0 && self.disks.frame.size.height != 0 {
-                self.disks.setFrameSize(NSSize(width: self.frame.width, height: 0))
-                self.recalculateHeight()
-            }
-            self.lastList = value.array.compactMap{ $0.uuid }
-        }
-        
-        self.disks.subviews.filter{ $0 is DiskView }.map{ $0 as! DiskView }.forEach { (v: DiskView) in
-            if !value.array.filter({ $0.popupState }).map({$0.uuid}).contains(v.uuid) {
-                v.removeFromSuperview()
-            }
-        }
-        value.array.filter({ $0.popupState }).forEach { (drive: drive) in
-            if let view = self.disks.subviews.filter({ $0 is DiskView }).map({ $0 as! DiskView }).first(where: { $0.uuid == drive.uuid }) {
-                view.update(drive)
-            } else {
-                let history = self.chartHistory[drive.uuid] ?? NetworkChartData(capacity: 30)
-                self.chartHistory[drive.uuid] = history
-                let view = DiskView(
-                    width: Constants.Popup.width,
-                    drive: drive,
-                    history: history,
-                    resize: self.recalculateHeight
-                )
-                if let activity = self.activity?.first(where: { $0.uuid == drive.uuid }) {
-                    view.updateStats(stats: activity.activity)
-                }
-                self.disks.addArrangedSubview(view)
-                if let smart = self.smartValues[drive.uuid] {
-                    view.updateSMART(smart)
-                }
-            }
-        }
-    }
-    
-    private func updateSettings(_ value: Disks) {
-        if self.settingsSection.contains("empty_view") {
-            self.settingsSection.delete("empty_view")
-        }
-        
-        self.lastList.filter { !value.map { $0.uuid }.contains($0) }.forEach { self.settingsSection.delete($0) }
-        value.forEach { (drive: drive) in
-            if !self.settingsSection.contains(drive.uuid) {
-                let btn = self.switchView(
-                    action: #selector(self.toggleDisk),
-                    state: drive.popupState
-                )
-                btn.identifier = NSUserInterfaceItemIdentifier(drive.uuid)
-                self.settingsSection.add(PreferencesRow(drive.mediaName, id: drive.uuid, component: btn))
-            }
-        }
-        
-        self.lastList = value.array.compactMap{ $0.uuid }
+        self.refreshRemoteVolumes()
+        if self.settingsLoaded { self.updateSettings() }
+        self.renderVolumes()
     }
     
     internal func activityCallback(_ value: Disks) {
-        self.activity = value
-        let date = Date()
-        value.forEach { drive in
-            let history = self.chartHistory[drive.uuid] ?? NetworkChartData(capacity: 30)
-            self.chartHistory[drive.uuid] = history
-            history.append(upload: Double(drive.activity.write), download: Double(drive.activity.read), at: date)
+        var activity = DiskActivity()
+        var counted: Set<String> = []
+        value.array.forEach { d in
+            activity.drives[d.uuid] = d.activity
+            // the volumes of one physical disk report the same counters: count them once
+            let counters = "\(d.activity.readBytes):\(d.activity.writeBytes)"
+            if d.activity.readBytes != 0 || d.activity.writeBytes != 0, !counted.insert(counters).inserted { return }
+            activity.read += Double(d.activity.read)
+            activity.write += Double(d.activity.write)
         }
-        guard self.contentLoaded else { return }
-        let views = self.disks.subviews.filter{ $0 is DiskView }.map{ $0 as! DiskView }
-        value.reversed().forEach { (drive: drive) in
-            if let view = views.first(where: { $0.uuid == drive.uuid }) {
-                view.updateStats(stats: drive.activity)
-            }
+        
+        DispatchQueue.main.async {
+            self.activityHistory.append((activity.read, activity.write))
+        }
+        self.apply(activity, to: self.activityCache, render: self.renderActivity)
+    }
+    
+    private func renderActivity(_ value: DiskActivity) {
+        let read = self.speed(value.read)
+        let write = self.speed(value.write)
+        self.readValue?.set("\(read.0) \(read.1)")
+        self.writeValue?.set("\(write.0) \(write.1)")
+        
+        let history = self.activityHistory.values
+        if let chart = self.chart {
+            chart.set(history)
+            // peaks of what the chart shows
+            let width = chart.bounds.width > 0 ? chart.bounds.width : self.frame.width - (ISMetrics.padH * 2)
+            let visible = history.suffix(max(1, Int(width / (chart.barWidth + chart.gap))))
+            self.peaks?.set(
+                read: self.speed(visible.map({ $0.0 }).max() ?? 0),
+                write: self.speed(visible.map({ $0.1 }).max() ?? 0)
+            )
+        }
+        
+        self.renderDots(value)
+    }
+    
+    private func renderDots(_ value: DiskActivity) {
+        self.diskCards.forEach { card in
+            let activity = value.drives[card.uuid]
+            card.setActivity(read: (activity?.read ?? 0) > 0, write: (activity?.write ?? 0) > 0)
         }
     }
     
     internal func smartCallback(_ value: Disks) {
-        value.forEach { (drive: drive) in
-            if let smart = drive.smart {
-                self.smartValues[drive.uuid] = smart
+        value.forEach { (d: drive) in
+            if let smart = d.smart {
+                self.smartValues[d.uuid] = smart
             }
         }
-        
-        let views = self.disks.subviews.filter{ $0 is DiskView }.map{ $0 as! DiskView }
-        views.forEach { (v: DiskView) in
-            if let smart = self.smartValues[v.uuid] {
-                v.updateSMART(smart)
-            }
-        }
+        // SMART values are shown in the tooltip of the disk cards
+        self.renderVolumes()
     }
     
     internal func processCallback(_ list: [Disk_process]) {
@@ -228,35 +366,45 @@ internal class Popup: PopupWrapper {
     }
     
     private func renderProcesses(_ list: [Disk_process]) {
-        if list.count != self.processes?.count { self.processes?.clear("-") }
-        
-        for i in 0..<list.count {
-            let process = list[i]
-            let write = Units(bytes: Int64(process.write)).getReadableSpeed(base: process.base, unit: process.speedUnit)
-            let read = Units(bytes: Int64(process.read)).getReadableSpeed(base: process.base, unit: process.speedUnit)
-            self.processes?.set(i, process, [read, write])
+        guard let processes = self.processes else { return }
+        let multiplier: Double = self.base == .bit ? 8 : 1
+        let n = min(list.count, processes.count)
+        for i in 0..<n {
+            processes.set(i, list[i], [
+                diskCompact(Double(list[i].read) * multiplier),
+                diskCompact(Double(list[i].write) * multiplier)
+            ])
         }
+        processes.clear(from: n)
     }
     
     internal func numberOfProcessesUpdated() {
-        if self.processes?.count == self.numberOfProcesses { return }
-        
-        DispatchQueue.main.async(execute: {
-            guard self.contentLoaded else { return }
-            self.processesView?.removeFromSuperview()
-            self.processesView = nil
-            self.processes = nil
-            self.addArrangedSubview(self.initProcesses())
+        DispatchQueue.main.async {
+            guard self.contentLoaded, self.processes?.count != self.numberOfProcesses else { return }
+            self.releaseContent()
             self.processesCache.initialized = false
-            self.recalculateHeight()
-        })
+            self.activityCache.initialized = false
+            self.prepareForDisplay()
+        }
+    }
+    
+    // "3,6" + "Mo/s"; the base and the unit chosen in the module settings are kept
+    private func speed(_ bytes: Double) -> (String, String) {
+        let base = self.base
+        let unit = self.speedUnit
+        if base == .byte && unit == NetworkSpeedUnitAuto {
+            let value = diskUnits(bytes)
+            return (value.0, "\(value.1)/s")
+        }
+        let value = Units(bytes: Int64(min(max(bytes, 0), 9e18))).getReadableTuple(base: base, unit: unit)
+        return (value.0.replacingOccurrences(of: ".", with: Locale.current.decimalSeparator ?? "."), value.1)
     }
     
     // MARK: - Settings
     
     public override func settings() -> NSView? {
         self.settingsLoaded = true
-        if let capacity = self.capacity { self.updateSettings(capacity) }
+        if self.capacity != nil { self.updateSettings() }
         let view = SettingsContainerView()
         
         view.addArrangedSubview(PreferencesSection([
@@ -299,6 +447,30 @@ internal class Popup: PopupWrapper {
         return view
     }
     
+    // one switch per volume the popup can show
+    private func updateSettings() {
+        if self.settingsSection.contains("empty_view") {
+            self.settingsSection.delete("empty_view")
+        }
+        
+        var entries: [(id: String, name: String, state: Bool)] = (self.capacity?.array ?? []).map { ($0.uuid, $0.mediaName, $0.popupState) }
+        entries += self.remoteVolumes.map { ($0.id, $0.name, self.volumeState($0.id)) }
+        
+        self.lastList.filter { id in !entries.contains(where: { $0.id == id }) }.forEach { self.settingsSection.delete($0) }
+        entries.forEach { entry in
+            if !self.settingsSection.contains(entry.id) {
+                let btn = self.switchView(
+                    action: #selector(self.toggleDisk),
+                    state: entry.state
+                )
+                btn.identifier = NSUserInterfaceItemIdentifier(entry.id)
+                self.settingsSection.add(PreferencesRow(entry.name, id: entry.id, component: btn))
+            }
+        }
+        
+        self.lastList = entries.map { $0.id }
+    }
+    
     @objc private func toggleMainColor(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         self.mainColorState = SColor.fromString(key, defaultValue: self.mainColorState)
@@ -308,641 +480,343 @@ internal class Popup: PopupWrapper {
         guard let key = sender.representedObject as? String else { return }
         self.writeColorState = SColor.fromString(key, defaultValue: self.writeColorState)
         Store.shared.set(key: "\(self.title)_writeColor", value: self.writeColorState.key)
-        if let color = self.writeColorState.additional as? NSColor {
-            self.processes?.setColor(1, color)
-            for view in self.disks.subviews.filter({ $0 is DiskView }).map({ $0 as! DiskView }) {
-                view.setChartColor(write: color)
-            }
-        }
     }
     @objc private func toggleReadColor(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         self.readColorState = SColor.fromString(key, defaultValue: self.readColorState)
         Store.shared.set(key: "\(self.title)_readColor", value: self.readColorState.key)
-        if let color = self.readColorState.additional as? NSColor {
-            self.processes?.setColor(0, color)
-            for view in self.disks.subviews.filter({ $0 is DiskView }).map({ $0 as! DiskView }) {
-                view.setChartColor(read: color)
-            }
-        }
     }
     @objc private func toggleReverseOrder(_ sender: NSControl) {
         self.reverseOrderState = controlState(sender)
-        for view in self.disks.subviews.filter({ $0 is DiskView }).map({ $0 as! DiskView }) {
-            view.setChartReverseOrder(self.reverseOrderState)
-        }
         Store.shared.set(key: "\(self.title)_reverseOrder", value: self.reverseOrderState)
-        self.display()
     }
     @objc private func toggleDisk(_ sender: NSControl) {
         guard let id = sender.identifier else { return }
         Store.shared.set(key: "\(self.title)_\(id.rawValue)_popup", value: controlState(sender))
+        self.renderVolumes()
     }
 }
 
-internal class DiskView: NSStackView {
-    internal var sizeCallback: (() -> Void) = {}
+// MARK: - Data
+
+private struct DiskActivity {
+    var read: Double = 0
+    var write: Double = 0
+    // by uuid
+    var drives: [String: stats] = [:]
+}
+
+// a volume shown as a row with a usage bar
+private struct DiskVolume {
+    let id: String
+    let name: String
+    let path: URL?
+    let size: Int64
+    let free: Int64
     
-    public var name: String
-    public var uuid: String
-    private let width: CGFloat
-    private let size: Int64
-    
-    private var nameView: NameView
-    private var chartView: ChartView
-    private var barView: BarChartView
-    private var legendView: LegendView
-    private var detailsView: DetailsView
-    
-    private var detailsState: Bool {
-        get { Store.shared.bool(key: "\(self.uuid)_details", defaultValue: false) }
-        set { Store.shared.set(key: "\(self.uuid)_details", value: newValue) }
+    var used: Double {
+        self.size > 0 ? Double(max(0, self.size - self.free)) / Double(self.size) : 0
+    }
+    var toolTip: String {
+        localizedString("Free disk memory", diskSize(self.free), diskSize(self.size))
     }
     
-    private var mainColor: NSColor {
-        SColor.fromString(Store.shared.string(key: "\(ModuleType.disk.stringValue)_mainColor", defaultValue: SColor.secondBlue.key)).additional as! NSColor
-    }
-    
-    init(width: CGFloat, drive d: drive, history: NetworkChartData, resize: @escaping () -> Void) {
-        self.sizeCallback = resize
-        self.uuid = d.uuid
+    init(_ d: drive) {
+        self.id = d.uuid
         self.name = d.mediaName
-        self.width = width
+        self.path = d.path
         self.size = d.size
-        let innerWidth: CGFloat = width - (Constants.Popup.margins * 2)
-        self.nameView = NameView(width: innerWidth, uuid: d.uuid, name: d.mediaName, path: d.path)
-        self.chartView = ChartView(width: innerWidth, history: history)
-        self.barView = BarChartView(frame: NSRect(x: 0, y: 0, width: innerWidth, height: 8), horizontal: true)
-        self.barView.widthAnchor.constraint(equalToConstant: innerWidth).isActive = true
-        self.barView.heightAnchor.constraint(equalToConstant: 8).isActive = true
-        if d.size != 0 {
-            self.barView.setValue(ColorValue(Double(d.size - d.free) / Double(d.size)))
-        }
-        self.legendView = LegendView(width: innerWidth, id: "\(d.mediaName)_\(d.path?.absoluteString ?? "")", size: d.size, free: d.free)
-        self.detailsView = DetailsView(width: innerWidth, details: d)
-        
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 0))
-        
-        self.widthAnchor.constraint(equalToConstant: width).isActive = true
-        self.orientation = .vertical
-        self.distribution = .fillProportionally
-        self.spacing = Constants.Popup.margins
-        self.edgeInsets = NSEdgeInsets(top: Constants.Popup.margins, left: 0, bottom: Constants.Popup.margins, right: 0)
-        self.wantsLayer = true
-        self.layer?.cornerRadius = Constants.Popup.radius
-        
-        self.nameView.detailsCallback = { [weak self] in
-            guard let s = self else { return }
-            s.detailsState = !s.detailsState
-            s.toggleDetails()
-        }
-        
-        self.addArrangedSubview(self.nameView)
-        self.addArrangedSubview(self.chartView)
-        self.addArrangedSubview(self.barView)
-        self.addArrangedSubview(self.legendView)
-        self.addArrangedSubview(self.detailsView)
-        
-        self.toggleDetails()
+        self.free = d.free
     }
     
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    override func updateLayer() {
-        self.layer?.backgroundColor = (self.isDarkMode ? NSColor(red: 17/255, green: 17/255, blue: 17/255, alpha: 0.25) : NSColor(red: 245/255, green: 245/255, blue: 245/255, alpha: 1)).cgColor
-    }
-    
-    public func update(_ value: drive) {
-        self.legendView.update(free: value.free)
-        if self.size != 0 {
-            self.barView.setValue(ColorValue(Double(self.size - value.free) / Double(self.size), color: self.mainColor))
-        }
-        self.detailsView.update(details: value)
-    }
-    
-    public func updateSMART(_ smart: smart_t?) {
-        self.detailsView.update(smart: smart)
-    }
-    
-    public func appear() {
-        self.chartView.appear()
-        self.legendView.appear()
-        self.detailsView.appear()
-    }
-    
-    public func updateStats(stats: stats) {
-        self.chartView.update(read: stats.read, write: stats.write)
-        self.detailsView.update(stats: stats)
-    }
-    public func setChartColor(read: NSColor? = nil, write: NSColor? = nil) {
-        self.chartView.setColors(read: read, write: write)
-    }
-    public func setChartReverseOrder(_ newValue: Bool) {
-        self.chartView.setReverseOrder(newValue)
-    }
-    
-    private func toggleDetails() {
-        if self.detailsState {
-            self.addArrangedSubview(self.detailsView)
-        } else {
-            self.detailsView.removeFromSuperview()
-        }
-        
-        let h = self.arrangedSubviews.map({ $0.bounds.height + self.spacing }).reduce(0, +) - 5 + (Constants.Popup.margins*2)
-        self.setFrameSize(NSSize(width: self.frame.width, height: h))
-        self.sizeCallback()
-    }
-}
-
-internal class NameView: NSStackView {
-    internal var detailsCallback: (() -> Void) = {}
-    
-    private let uuid: String
-    private let uri: URL?
-    private let finder: URL?
-    
-    private var detailsState: Bool { Store.shared.bool(key: "\(self.uuid)_details", defaultValue: false) }
-    
-    public init(width: CGFloat, uuid: String, name: String, path: URL?) {
-        self.uuid = uuid
-        self.uri = path
-        self.finder = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Finder")
-        
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 16))
-        
-        self.orientation = .horizontal
-        self.alignment = .centerY
-        self.spacing = 4
-        
-        self.toolTip = localizedString("Open disk")
-        
-        let nameField = NSButton()
-        nameField.bezelStyle = .inline
-        nameField.isBordered = false
-        nameField.contentTintColor = .labelColor
-        nameField.action = #selector(self.openDisk)
-        nameField.target = self
-        nameField.toolTip = name
-        nameField.title = name
-        nameField.cell?.truncatesLastVisibleLine = true
-        
-        let detailsButton = PopupButton(toolTip: localizedString("Disk details"), state: self.detailsState) { [weak self] in
-            self?.detailsCallback()
-        }
-        
-        self.addArrangedSubview(nameField)
-        self.addArrangedSubview(NSView())
-        self.addArrangedSubview(detailsButton)
-        
-        self.widthAnchor.constraint(equalToConstant: self.frame.width).isActive = true
-        self.heightAnchor.constraint(equalToConstant: self.frame.height).isActive = true
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    @objc private func openDisk() {
-        if let uri = self.uri, let finder = self.finder {
-            (self.window as? PopupWindow)?.dismissIfUnlocked()
-            NSWorkspace.shared.open([uri], withApplicationAt: finder, configuration: NSWorkspace.OpenConfiguration())
-        }
-    }
-}
-
-internal class ChartView: NSStackView {
-    private var chart: NetworkChartView? = nil
-    private let cache = PopupCache<(read: Int64?, write: Int64?)>()
-    
-    private let readColorView = ColorBlock()
-    private let writeColorView = ColorBlock()
-    
-    private let readValueField: ValueField = {
-        let field = ValueField("0 KB/s")
-        field.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        field.alignment = .trailing
-        field.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        return field
-    }()
-    private let writeValueField: ValueField = {
-        let field = ValueField("0 KB/s")
-        field.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        field.alignment = .trailing
-        field.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        return field
-    }()
-    
-    private var readColor: NSColor {
-        SColor.fromString(Store.shared.string(key: "\(ModuleType.disk.stringValue)_readColor", defaultValue: SColor.secondBlue.key)).additional as! NSColor
-    }
-    private var writeColor: NSColor {
-        SColor.fromString(Store.shared.string(key: "\(ModuleType.disk.stringValue)_writeColor", defaultValue: SColor.secondRed.key)).additional as! NSColor
-    }
-    private var base: DataSizeBase {
-        DataSizeBase(rawValue: Store.shared.string(key: "\(ModuleType.disk.stringValue)_base", defaultValue: DataSizeBase.byte.rawValue)) ?? .byte
-    }
-    private var speedUnit: String {
-        networkSpeedUnit(from: Store.shared.string(key: "\(ModuleType.disk.stringValue)_speedUnit", defaultValue: NetworkSpeedUnitAuto)).key
-    }
-    private var reverseOrder: Bool = Store.shared.bool(key: "\(ModuleType.disk.stringValue)_reverseOrder", defaultValue: false)
-    
-    public init(width: CGFloat, history: NetworkChartData) {
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 50))
-        
-        self.wantsLayer = true
-        self.layer?.cornerRadius = 3
-        
-        self.orientation = .horizontal
-        self.spacing = Constants.Popup.margins
-        
-        self.readColorView.set(color: self.readColor)
-        self.writeColorView.set(color: self.writeColor)
-        
-        let io: NSStackView = {
-            let view = NSStackView()
-            view.widthAnchor.constraint(equalToConstant: 70).isActive = true
-            view.orientation = .vertical
-            view.alignment = .width
-            view.spacing = Constants.Popup.margins
-            
-            let input = NSStackView()
-            input.orientation = .horizontal
-            input.spacing = Constants.Popup.spacing
-            input.addArrangedSubview(self.readColorView)
-            input.addArrangedSubview(NSView())
-            input.addArrangedSubview(self.readValueField)
-            
-            let output = NSStackView()
-            output.orientation = .horizontal
-            output.spacing = Constants.Popup.spacing
-            output.addArrangedSubview(self.writeColorView)
-            output.addArrangedSubview(NSView())
-            output.addArrangedSubview(self.writeValueField)
-            
-            view.addArrangedSubview(input)
-            view.addArrangedSubview(output)
-            
-            return view
-        }()
-        
-        let chart = NetworkChartView(frame: NSRect(
-            x: 0,
-            y: 1,
-            width: self.frame.width - 70 - Constants.Popup.margins,
-            height: self.frame.height - 2
-        ), num: 30, minMax: false, reversedOrder: self.reverseOrder, outColor: self.writeColor, inColor: self.readColor, history: history)
-        chart.setTooltipState(false)
-        self.chart = chart
-        
-        self.addArrangedSubview(io)
-        self.addArrangedSubview(chart)
-        
-        self.widthAnchor.constraint(equalToConstant: self.frame.width).isActive = true
-        self.heightAnchor.constraint(equalToConstant: self.frame.height).isActive = true
-    }
-    
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-    
-    public func update(read: Int64, write: Int64) {
-        self.chart?.historyUpdated()
-        self.cache.apply((read, write), visible: self.window?.isVisible ?? false, render: self.renderActivity)
-    }
-    
-    private func renderActivity(_ value: (read: Int64?, write: Int64?)) {
-        let top: Int64? = self.reverseOrder ? value.read : value.write
-        let bottom: Int64? = self.reverseOrder ? value.write : value.read
-        let topColor = self.reverseOrder ? self.readColor : self.writeColor
-        let bottomColor = self.reverseOrder ? self.writeColor : self.readColor
-        
-        if let top {
-            self.readColorView.set(color: top != 0 ? topColor : nil)
-            self.readValueField.stringValue = Units(bytes: top).getReadableSpeed(base: self.base, unit: self.speedUnit)
-        }
-        if let bottom {
-            self.writeColorView.set(color: bottom != 0 ? bottomColor : nil)
-            self.writeValueField.stringValue = Units(bytes: bottom).getReadableSpeed(base: self.base, unit: self.speedUnit)
-        }
-    }
-    
-    public func appear() {
-        self.cache.replay(render: self.renderActivity)
-        self.chart?.display()
-    }
-    
-    public func setColors(read: NSColor? = nil, write: NSColor? = nil) {
-        self.chart?.setColors(in: read, out: write)
-        self.readColorView.set(color: read)
-        self.writeColorView.set(color: write)
-    }
-    
-    public func setReverseOrder(_ newValue: Bool) {
-        self.reverseOrder = newValue
-        self.chart?.setReverseOrder(newValue)
-        self.cache.replay(render: self.renderActivity)
-    }
-}
-
-private class LegendView: NSView {
-    private let size: Int64
-    private var free: Int64
-    private let id: String
-    private let cache = PopupCache<Int64>()
-    
-    private var showUsedSpace: Bool {
-        get { Store.shared.bool(key: "\(self.id)_usedSpace", defaultValue: false) }
-        set { Store.shared.set(key: "\(self.id)_usedSpace", value: newValue) }
-    }
-    
-    private var legendField: NSTextField? = nil
-    private var percentageField: NSTextField? = nil
-    
-    public init(width: CGFloat, id: String, size: Int64, free: Int64) {
+    init(id: String, name: String, path: URL?, size: Int64, free: Int64) {
         self.id = id
+        self.name = name
+        self.path = path
         self.size = size
         self.free = free
+    }
+    
+    // mounted network file systems, the ones the Finder shows. Reads what the kernel already knows: never waits for a server.
+    static func remote() -> [DiskVolume] {
+        let mounted = Int(getfsstat(nil, 0, MNT_NOWAIT))
+        guard mounted >= 1 else { return [] }
+        let template = statfs()
+        var buffer = Array(repeating: template, count: mounted + 4)
+        let n = Int(getfsstat(&buffer, Int32(MemoryLayout.stride(ofValue: template) * buffer.count), MNT_NOWAIT))
+        guard n >= 1 else { return [] }
         
-        super.init(frame: CGRect(x: 0, y: 0, width: width, height: 16))
-        self.toolTip = localizedString("Switch view")
+        var list: [DiskVolume] = []
+        for var stat in buffer.prefix(n) {
+            let flags = Int32(bitPattern: stat.f_flags)
+            guard flags & MNT_LOCAL == 0, flags & MNT_DONTBROWSE == 0, stat.f_blocks > 0 else { continue }
+            
+            let path = withUnsafePointer(to: &stat.f_mntonname) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+            }
+            let name = (path as NSString).lastPathComponent
+            guard !name.isEmpty, name != "/" else { continue }
+            
+            let blockSize = Int64(stat.f_bsize)
+            let (size, sizeOverflow) = Int64(clamping: stat.f_blocks).multipliedReportingOverflow(by: blockSize)
+            let (free, freeOverflow) = Int64(clamping: stat.f_bavail).multipliedReportingOverflow(by: blockSize)
+            guard !sizeOverflow, !freeOverflow, size > 0 else { continue }
+            
+            list.append(DiskVolume(
+                id: "network:\(path)",
+                name: name,
+                path: URL(fileURLWithPath: path, isDirectory: true),
+                size: size,
+                free: min(free, size)
+            ))
+        }
         
-        let height: CGFloat = 14
-        let view: NSView = NSView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: self.frame.height))
+        return list.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+}
+
+// MARK: - Formatting
+
+// "616,2" + "Go": three to four digits, decimal units like the Finder
+private func diskUnits(_ bytes: Double) -> (String, String) {
+    let value = max(0, bytes)
+    if value < 999_500 {
+        return ("\(Int((value / 1_000).rounded()))", isL("KB", fr: "Ko"))
+    } else if value < 999_950_000 {
+        let v = value / 1_000_000
+        return (isNumber(v, digits: v < 99.95 ? 1 : 0), isL("MB", fr: "Mo"))
+    } else if value < 999_950_000_000 {
+        let v = value / 1_000_000_000
+        return (isNumber(v, digits: v < 9.995 ? 2 : 1), isL("GB", fr: "Go"))
+    }
+    return (isNumber(value / 1_000_000_000_000, digits: 2), isL("TB", fr: "To"))
+}
+
+private func diskSize(_ bytes: Int64) -> String {
+    let value = diskUnits(Double(bytes))
+    return "\(value.0) \(value.1)"
+}
+
+// process columns: "2K", "8,8M", "-" when there is nothing to show
+private func diskCompact(_ bytes: Double) -> String {
+    if bytes < 500 {
+        return "-"
+    } else if bytes < 999_500 {
+        return "\(Int((bytes / 1_000).rounded()))K"
+    } else if bytes < 999_950_000 {
+        let v = bytes / 1_000_000
+        return "\(isNumber(v, digits: v < 99.95 ? 1 : 0))M"
+    }
+    let v = bytes / 1_000_000_000
+    return "\(isNumber(v, digits: v < 99.95 ? 1 : 0))G"
+}
+
+private func diskOpen(_ url: URL?, from view: NSView) {
+    guard let url, let finder = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Finder") else { return }
+    (view.window as? PopupWindow)?.dismissIfUnlocked()
+    NSWorkspace.shared.open([url], withApplicationAt: finder, configuration: NSWorkspace.OpenConfiguration())
+}
+
+// MARK: - Views
+
+// ring with the used share, name and free space, read and write activity dots. Opens the volume on click.
+private final class DiskCard: ISCard {
+    let uuid: String
+    
+    private let ring: ISRing = ISRing(diameter: 30, lineWidth: 3)
+    private let percentField: ISText
+    private let nameField: ISText
+    private let freeField: ISText
+    private let readDot: ISDot
+    private let writeDot: ISDot
+    private let readColor: NSColor
+    private let writeColor: NSColor
+    
+    private var path: URL?
+    private var activity: (read: Bool, write: Bool) = (false, false)
+    
+    init(_ d: drive) {
+        let theme = ISTheme.current
+        self.uuid = d.uuid
+        self.path = d.path
+        self.readColor = theme.pink
+        self.writeColor = theme.blue
+        self.percentField = ISText("", font: ISFont.value(11), color: theme.value, alignment: .center)
+        self.nameField = ISText(d.mediaName, font: ISFont.label(13), color: theme.label)
+        self.freeField = ISText("", font: ISFont.value(13, weight: .regular), color: theme.value)
+        self.readDot = ISDot(theme.pink.withAlphaComponent(0.3), size: 8)
+        self.writeDot = ISDot(theme.blue.withAlphaComponent(0.3), size: 8)
         
-        let legendField = TextView(frame: NSRect(x: isRTL ? 40 : 0, y: (view.frame.height-height)/2, width: view.frame.width - 40, height: height))
-        legendField.font = NSFont.systemFont(ofSize: 11, weight: .light)
-        legendField.stringValue = self.legend(free: free)
-        legendField.cell?.truncatesLastVisibleLine = true
+        super.init()
+        self.edgeInsets = NSEdgeInsets(top: 4, left: ISMetrics.padH, bottom: 4, right: ISMetrics.padH)
         
-        let percentageField = TextView(frame: NSRect(x: isRTL ? 0 : view.frame.width - 40, y: (view.frame.height-height)/2, width: 40, height: height))
-        percentageField.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        percentageField.alignment = .trailing
-        percentageField.stringValue = self.percentage(free: free)
+        let body = NSView()
+        body.translatesAutoresizingMaskIntoConstraints = false
+        body.heightAnchor.constraint(equalToConstant: ISMetrics.row * 2).isActive = true
         
-        view.addSubview(legendField)
-        view.addSubview(percentageField)
-        self.addSubview(view)
+        self.nameField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.freeField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        [self.ring, self.percentField, self.nameField, self.freeField, self.readDot, self.writeDot].forEach { body.addSubview($0) }
         
-        self.legendField = legendField
-        self.percentageField = percentageField
+        NSLayoutConstraint.activate([
+            self.ring.leadingAnchor.constraint(equalTo: body.leadingAnchor),
+            self.ring.centerYAnchor.constraint(equalTo: body.centerYAnchor),
+            self.percentField.centerXAnchor.constraint(equalTo: self.ring.centerXAnchor),
+            self.percentField.centerYAnchor.constraint(equalTo: self.ring.centerYAnchor),
+            
+            self.nameField.leadingAnchor.constraint(equalTo: self.ring.trailingAnchor, constant: 6),
+            self.nameField.centerYAnchor.constraint(equalTo: body.topAnchor, constant: ISMetrics.row / 2),
+            self.freeField.leadingAnchor.constraint(equalTo: self.nameField.leadingAnchor),
+            self.freeField.centerYAnchor.constraint(equalTo: body.bottomAnchor, constant: -(ISMetrics.row / 2)),
+            
+            self.readDot.trailingAnchor.constraint(equalTo: body.trailingAnchor),
+            self.readDot.centerYAnchor.constraint(equalTo: self.nameField.centerYAnchor),
+            self.writeDot.trailingAnchor.constraint(equalTo: body.trailingAnchor),
+            self.writeDot.centerYAnchor.constraint(equalTo: self.freeField.centerYAnchor),
+            
+            self.nameField.trailingAnchor.constraint(lessThanOrEqualTo: self.readDot.leadingAnchor, constant: -6),
+            self.freeField.trailingAnchor.constraint(lessThanOrEqualTo: self.writeDot.leadingAnchor, constant: -6)
+        ])
+        self.add(body)
         
-        let trackingArea = NSTrackingArea(
-            rect: CGRect(x: 0, y: 0, width: self.frame.width, height: self.frame.height),
-            options: [NSTrackingArea.Options.activeAlways, NSTrackingArea.Options.mouseEnteredAndExited, NSTrackingArea.Options.activeInActiveApp],
-            owner: self,
-            userInfo: nil
-        )
-        self.addTrackingArea(trackingArea)
-        
-        self.widthAnchor.constraint(equalToConstant: self.frame.width).isActive = true
-        self.heightAnchor.constraint(equalToConstant: self.frame.height).isActive = true
+        self.onClick = { [weak self] in
+            guard let self else { return }
+            diskOpen(self.path, from: self)
+        }
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
-    public func update(free: Int64) {
-        self.free = free
-        self.cache.apply(free, visible: self.window?.isVisible ?? false, render: self.renderLegend)
+    func update(_ d: drive, toolTip: String) {
+        self.path = d.path
+        self.nameField.stringValue = d.mediaName
+        self.ring.set(value: d.percentage)
+        self.percentField.stringValue = "\(Int((d.percentage * 100).rounded()))"
+        self.freeField.stringValue = "\(diskSize(d.free)) \(isL("available", fr: "disponibles"))"
+        self.toolTip = toolTip
     }
     
-    private func renderLegend(_ free: Int64) {
-        if let view = self.legendField {
-            view.stringValue = self.legend(free: free)
-        }
-        if let view = self.percentageField {
-            view.stringValue = self.percentage(free: free)
-        }
+    // bright when the disk was read / written during the last sample
+    func setActivity(read: Bool, write: Bool) {
+        guard self.activity != (read, write) else { return }
+        self.activity = (read, write)
+        self.readDot.color = read ? self.readColor : self.readColor.withAlphaComponent(0.3)
+        self.writeDot.color = write ? self.writeColor : self.writeColor.withAlphaComponent(0.3)
     }
+}
+
+// name on the left, usage bar on the right. Opens the volume on click.
+private final class DiskVolumeRow: NSView {
+    private let nameField: ISText
+    private let bar: ISProgressBar = ISProgressBar()
+    private var path: URL?
     
-    public func appear() {
-        self.cache.replay(render: self.renderLegend)
-    }
-    
-    private func legend(free: Int64) -> String {
-        var value: String
+    init(_ volume: DiskVolume) {
+        self.nameField = ISText(volume.name, font: ISFont.label(13), color: ISTheme.current.value)
+        super.init(frame: .zero)
+        self.translatesAutoresizingMaskIntoConstraints = false
+        self.heightAnchor.constraint(equalToConstant: ISMetrics.row).isActive = true
         
-        if self.showUsedSpace {
-            var usedSpace = self.size - free
-            if usedSpace < 0 {
-                usedSpace = 0
-            }
-            value = localizedString("Used disk memory", DiskSize(usedSpace).getReadableMemory(), DiskSize(self.size).getReadableMemory())
+        self.nameField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.addSubview(self.nameField)
+        self.addSubview(self.bar)
+        NSLayoutConstraint.activate([
+            self.nameField.leadingAnchor.constraint(equalTo: self.leadingAnchor),
+            self.nameField.centerYAnchor.constraint(equalTo: self.centerYAnchor),
+            self.bar.trailingAnchor.constraint(equalTo: self.trailingAnchor),
+            self.bar.centerYAnchor.constraint(equalTo: self.centerYAnchor),
+            self.bar.widthAnchor.constraint(equalToConstant: 80),
+            self.nameField.trailingAnchor.constraint(lessThanOrEqualTo: self.bar.leadingAnchor, constant: -8)
+        ])
+        
+        self.update(volume)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    func update(_ volume: DiskVolume) {
+        self.path = volume.path
+        self.nameField.stringValue = volume.name
+        self.bar.set(volume.used)
+        self.toolTip = volume.toolTip
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        if self.bounds.contains(self.convert(event.locationInWindow, from: nil)) {
+            diskOpen(self.path, from: self)
         } else {
-            value = localizedString("Free disk memory", DiskSize(free).getReadableMemory(), DiskSize(self.size).getReadableMemory())
-        }
-        
-        return value
-    }
-    
-    private func percentage(free: Int64) -> String {
-        guard self.size != 0 else {
-            return "0%"
-        }
-        var percentage: Int
-        
-        if self.showUsedSpace {
-            percentage = Int((Double(self.size - free) / Double(self.size)) * 100)
-        } else {
-            percentage = Int((Double(free) / Double(self.size)).rounded(toPlaces: 2) * 100)
-        }
-        
-        return "\(percentage < 0 ? 0 : percentage)%"
-    }
-    
-    override func mouseEntered(with: NSEvent) {
-        NSCursor.pointingHand.set()
-    }
-    
-    override func mouseExited(with: NSEvent) {
-        NSCursor.arrow.set()
-    }
-    
-    override func mouseDown(with: NSEvent) {
-        self.showUsedSpace = !self.showUsedSpace
-        
-        if let view = self.legendField {
-            view.stringValue = self.legend(free: self.free)
-        }
-        if let view = self.percentageField {
-            view.stringValue = self.percentage(free: self.free)
+            super.mouseUp(with: event)
         }
     }
 }
 
-internal class DetailsView: NSStackView {
-    private var smartHeight: CGFloat {
-        get { (22*8) + Constants.Popup.separatorHeight }
-    }
+// peaks of the visible history: "Lecture 24,0 Mo/s" on the left, "Écriture 19,4 Mo/s" on the right
+private final class DiskPeakRow: NSView {
+    private let readField: ISText = ISText()
+    private let writeField: ISText = ISText(alignment: .right)
+    private let readLabel: String
+    private let writeLabel: String
     
-    private var totalReadValueField: ValueField?
-    private var totalWrittenValueField: ValueField?
-    private var fileSystemValueField: ValueField?
-    private var connectionTypeValueField: ValueField?
-    
-    private var smartTotalReadValueField: ValueField?
-    private var smartTotalWrittenValueField: ValueField?
-    private var temperatureValueField: ValueField?
-    private var healthValueField: ValueField?
-    private var powerCyclesValueField: ValueField?
-    private var powerOnHoursValueField: ValueField?
-    private var criticalWarningValueField: ValueField?
-    private var availableSpareValueField: ValueField?
-    
-    private let statsCache = PopupCache<stats>()
-    private let smartCache = PopupCache<smart_t>()
-    
-    public init(width: CGFloat, details: drive? = nil) {
-        super.init(frame: CGRect(x: 0, y: 0, width: width, height: 0))
+    init(read: String, write: String) {
+        self.readLabel = read
+        self.writeLabel = write
+        super.init(frame: .zero)
+        self.translatesAutoresizingMaskIntoConstraints = false
+        self.heightAnchor.constraint(equalToConstant: ISMetrics.row).isActive = true
         
-        self.orientation = .vertical
-        self.distribution = .fillProportionally
-        self.spacing = 0
+        self.readField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.writeField.setContentCompressionResistancePriority(.required, for: .horizontal)
+        self.writeField.setContentHuggingPriority(.required, for: .horizontal)
+        self.addSubview(self.readField)
+        self.addSubview(self.writeField)
+        NSLayoutConstraint.activate([
+            self.readField.leadingAnchor.constraint(equalTo: self.leadingAnchor),
+            self.readField.centerYAnchor.constraint(equalTo: self.centerYAnchor),
+            self.writeField.trailingAnchor.constraint(equalTo: self.trailingAnchor),
+            self.writeField.centerYAnchor.constraint(equalTo: self.centerYAnchor),
+            self.readField.trailingAnchor.constraint(lessThanOrEqualTo: self.writeField.leadingAnchor, constant: -6)
+        ])
         
-        self.addArrangedSubview(self.initSpeed())
-        self.addArrangedSubview(self.initSmart())
-        
-        if let details {
-            self.update(details: details)
-        }
-        
-        self.recalculateHeight()
+        self.set(read: ("—", ""), write: ("—", ""))
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
-    private func recalculateHeight() {
-        var h: CGFloat = 0
-        self.arrangedSubviews.forEach { v in
-            if let v = v as? NSStackView {
-                h += v.arrangedSubviews.map({ $0.bounds.height }).reduce(0, +)
-            } else {
-                h += v.bounds.height
-            }
+    func set(read: (String, String), write: (String, String)) {
+        self.readField.attributedStringValue = self.text(self.readLabel, read, alignment: .left)
+        self.writeField.attributedStringValue = self.text(self.writeLabel, write, alignment: .right)
+    }
+    
+    // label in light gray, number in white, unit smaller
+    private func text(_ label: String, _ value: (String, String), alignment: NSTextAlignment) -> NSAttributedString {
+        let theme = ISTheme.current
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = alignment
+        paragraph.lineBreakMode = .byTruncatingTail
+        
+        let result = NSMutableAttributedString(string: "\(label) ", attributes: [
+            .font: ISFont.label(13),
+            .foregroundColor: theme.label,
+            .paragraphStyle: paragraph
+        ])
+        result.append(NSAttributedString(string: value.0, attributes: [
+            .font: ISFont.value(13),
+            .foregroundColor: theme.value,
+            .paragraphStyle: paragraph
+        ]))
+        if !value.1.isEmpty {
+            result.append(NSAttributedString(string: " \(value.1)", attributes: [
+                .font: ISFont.value(10),
+                .foregroundColor: theme.value,
+                .paragraphStyle: paragraph
+            ]))
         }
-        if self.frame.size.height != h {
-            self.setFrameSize(NSSize(width: self.frame.width, height: h))
-        }
-    }
-    
-    private func initSpeed() -> NSView {
-        let view: NSView = NSView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: 22*4))
-        view.widthAnchor.constraint(equalToConstant: view.bounds.width).isActive = true
-        view.heightAnchor.constraint(equalToConstant: view.bounds.height).isActive = true
-        let container: NSStackView = NSStackView(frame: NSRect(x: 0, y: 0, width: view.frame.width, height: view.frame.height))
-        container.orientation = .vertical
-        container.spacing = 0
-        
-        self.totalReadValueField = popupRow(container, title: "\(localizedString("Total read")):", value: "0 KB").1
-        self.totalWrittenValueField = popupRow(container, title: "\(localizedString("Total written")):", value: "0 KB").1
-        
-        self.fileSystemValueField = popupRow(container, title: "\(localizedString("File system")):", value: localizedString("Unknown")).1
-        self.connectionTypeValueField = popupRow(container, title: "\(localizedString("Connection type")):", value: localizedString("Unknown")).1
-        
-        self.totalReadValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.totalWrittenValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        
-        self.fileSystemValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.connectionTypeValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        
-        view.addSubview(container)
-        
-        return view
-    }
-    
-    private func initSmart() -> NSView {
-        let view: NSView = NSView(frame: NSRect(x: 0, y: 0, width: self.frame.width, height: self.smartHeight))
-        view.widthAnchor.constraint(equalToConstant: view.bounds.width).isActive = true
-        view.heightAnchor.constraint(equalToConstant: view.bounds.height).isActive = true
-        let separator = separatorView("SMART", origin: NSPoint(x: 0, y: self.smartHeight-Constants.Popup.separatorHeight), width: self.frame.width)
-        let container: NSStackView = NSStackView(frame: NSRect(x: 0, y: 0, width: view.frame.width, height: separator.frame.origin.y))
-        container.orientation = .vertical
-        container.spacing = 0
-        
-        self.smartTotalReadValueField = popupRow(container, title: "\(localizedString("Total read")):", value: "0 KB").1
-        self.smartTotalWrittenValueField = popupRow(container, title: "\(localizedString("Total written")):", value: "0 KB").1
-        self.temperatureValueField = popupRow(container, title: "\(localizedString("Temperature")):", value: "\(temperature(0))").1
-        self.healthValueField = popupRow(container, title: "\(localizedString("Health")):", value: "0%").1
-        self.powerCyclesValueField = popupRow(container, title: "\(localizedString("Power cycles")):", value: "0").1
-        self.powerOnHoursValueField = popupRow(container, title: "\(localizedString("Power on hours")):", value: "0").1
-        self.criticalWarningValueField = popupRow(container, title: "\(localizedString("Critical warning")):", value: localizedString("Unknown")).1
-        self.availableSpareValueField = popupRow(container, title: "\(localizedString("Available spare")):", value: localizedString("Unknown")).1
-        
-        self.smartTotalReadValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.smartTotalWrittenValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.temperatureValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.healthValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.powerCyclesValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.powerOnHoursValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.criticalWarningValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        self.availableSpareValueField?.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-        
-        view.addSubview(separator)
-        view.addSubview(container)
-        
-        return view
-    }
-    
-    public func update(stats: stats) {
-        self.statsCache.apply(stats, visible: self.window?.isVisible ?? false, render: self.renderStats)
-    }
-    
-    private func renderStats(_ stats: stats) {
-        self.totalReadValueField?.stringValue = Units(bytes: stats.readBytes).getReadableMemory()
-        self.totalReadValueField?.toolTip = "\(stats.readBytes / (512 * 1000))"
-        self.totalWrittenValueField?.stringValue = Units(bytes: stats.writeBytes).getReadableMemory()
-        self.totalWrittenValueField?.toolTip = "\(stats.writeBytes / (512 * 1000))"
-    }
-    
-    public func update(details d: drive) {
-        self.fileSystemValueField?.stringValue = d.fileSystem.isEmpty ? localizedString("Unknown") : d.fileSystem.uppercased()
-        self.connectionTypeValueField?.stringValue = d.connectionType.isEmpty ? localizedString("Unknown") : d.connectionType
-    }
-    
-    public func update(smart: smart_t?) {
-        guard let smart else { return }
-        self.smartCache.apply(smart, visible: self.window?.isVisible ?? false, render: self.renderSmart)
-    }
-    
-    private func renderSmart(_ smart: smart_t) {
-        self.smartTotalReadValueField?.toolTip = "\(smart.totalRead / (512 * 1000))"
-        self.smartTotalWrittenValueField?.toolTip = "\(smart.totalWritten / (512 * 1000))"
-        self.smartTotalReadValueField?.stringValue = Units(bytes: smart.totalRead).getReadableMemory()
-        self.smartTotalWrittenValueField?.stringValue = Units(bytes: smart.totalWritten).getReadableMemory()
-        
-        self.temperatureValueField?.stringValue = "\(temperature(Double(smart.temperature)))"
-        self.healthValueField?.stringValue = "\(smart.life)%"
-        
-        self.powerCyclesValueField?.stringValue = "\(smart.powerCycles)"
-        self.powerOnHoursValueField?.stringValue = "\(smart.powerOnHours)"
-        
-        if let warning = smart.criticalWarning {
-            let list = smartCriticalWarnings(warning)
-            self.criticalWarningValueField?.stringValue = list.isEmpty ? localizedString("None") : list.joined(separator: ", ")
-            self.criticalWarningValueField?.textColor = list.isEmpty ? .textColor : .systemRed
-        } else {
-            self.criticalWarningValueField?.stringValue = localizedString("Unavailable")
-            self.criticalWarningValueField?.textColor = .textColor
-        }
-        
-        if let spare = smart.availableSpare {
-            self.availableSpareValueField?.stringValue = "\(spare)%"
-            if let threshold = smart.spareThreshold {
-                self.availableSpareValueField?.textColor = spare < threshold ? .systemRed : .textColor
-                self.availableSpareValueField?.toolTip = "\(localizedString("Threshold")): \(threshold)%"
-            }
-        } else {
-            self.availableSpareValueField?.stringValue = localizedString("Unavailable")
-        }
-    }
-    
-    public func appear() {
-        self.statsCache.replay(render: self.renderStats)
-        self.smartCache.replay(render: self.renderSmart)
+        return result
     }
 }

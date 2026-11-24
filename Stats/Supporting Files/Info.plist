@@ -37,6 +37,10 @@
 	<string>This permission allows obtaining battery level of Bluetooth devices</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2020 Serhiy Mytrovtsiy. All rights reserved.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Stats shows the events of the selected day in the clock menu.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Stats shows the events of the selected day in the clock menu.</string>
 	<key>NSLocationUsageDescription</key>
 	<string>This permission allows displaying the connected Wi-Fi network name and BSSID.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

@@ -221,10 +221,11 @@ internal class CombinedView: NSObject, NSGestureRecognizerDelegate {
         let visibleModules = self.activeModules.filter({ !$0.menuBar.activeWidgets.isEmpty })
         guard let module = visibleModules.last(where: { $0.menuBar.view.frame.minX <= location.x }) ?? visibleModules.first else { return }
         
+        // anchor the popup under the clicked module, not under the middle of the whole bar
         var userInfo: [String: Any] = [
             "module": module.name,
-            "origin": window.frame.origin,
-            "center": window.frame.width/2
+            "origin": NSPoint(x: window.frame.origin.x + module.menuBar.view.frame.minX, y: window.frame.origin.y),
+            "center": module.menuBar.view.frame.width/2
         ]
         let widgetLocation = module.menuBar.view.convert(location, from: self.view)
         let widgets = module.menuBar.activeWidgets

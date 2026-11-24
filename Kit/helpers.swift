@@ -942,7 +942,7 @@ internal class WidgetLabelView: NSView {
     private var title: String
     
     internal init(_ title: String, height: CGFloat) {
-        self.title = title
+        self.title = title == "RAM" ? "MEM" : title
         
         super.init(frame: NSRect(
             x: 0,

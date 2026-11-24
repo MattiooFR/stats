@@ -384,6 +384,79 @@ open class Module {
         }
     }
     
+    // review mode: a window under the wallpaper is composited (it can be captured) but nobody sees it.
+    // A window placed outside the screen cannot be captured, and the system moves it back in anyway.
+    public static let debugWindowLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) - 1)
+    
+    // opens the popup at a given position, hidden under the wallpaper, and keeps it open to review how it looks
+    public func debugShowPopup(at origin: NSPoint) -> Int? {
+        guard self.enabled, self.popupView != nil else { return nil }
+        if let view = self.popupView as? PopupWrapper {
+            view.prepareForDisplay()
+        }
+        if self.popup == nil {
+            self.popup = PopupWindow(title: self.config.name, module: self.moduleType, view: self.popupView, visibilityCallback: self.popupVisibilityCallback)
+        }
+        guard let popup = self.popup else { return nil }
+        popup.locked = true
+        popup.level = Module.debugWindowLevel
+        popup.setFrameOrigin(origin)
+        popup.orderFrontRegardless()
+        return popup.windowNumber
+    }
+
+    // review mode: plays the pointer entering or leaving the n-th card that has a side panel,
+    // through the same mouseEntered / mouseExited the tracking area calls
+    public func debugHover(_ index: Int, enter: Bool) {
+        guard let view = self.popupView else { return }
+        var cards: [ISCard] = []
+        func walk(_ parent: NSView) {
+            if let card = parent as? ISCard, card.detail != nil {
+                cards.append(card)
+            }
+            parent.subviews.forEach { walk($0) }
+        }
+        walk(view)
+        guard cards.indices.contains(index), let event = NSEvent.enterExitEvent(
+            with: enter ? .mouseEntered : .mouseExited,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: cards[index].window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 0,
+            trackingNumber: 0,
+            userData: nil
+        ) else { return }
+        if enter {
+            cards[index].mouseEntered(with: event)
+        } else {
+            cards[index].mouseExited(with: event)
+        }
+    }
+    
+    // opens the side panel of every card that has one, side by side, to review how they look
+    public func debugShowDetails(from origin: NSPoint) -> [(String, Int)] {
+        guard self.enabled, let view = self.popupView else { return [] }
+        var result: [(String, Int)] = []
+        var seen: Set<String> = []
+        var x = origin.x
+
+        func walk(_ parent: NSView) {
+            if let card = parent as? ISCard, card.detail != nil {
+                let id = card.detailID ?? "card\(result.count)"
+                if !seen.contains(id), let number = ISDetailController.shared.debugOpen(card, at: NSPoint(x: x, y: origin.y)) {
+                    seen.insert(id)
+                    result.append((id, number))
+                    x += 40
+                }
+            }
+            parent.subviews.forEach { walk($0) }
+        }
+        walk(view)
+        return result
+    }
+    
     @objc private func listenForModuleToggle(_ notification: Notification) {
         if let name = notification.userInfo?["module"] as? String {
             if name == self.config.name {

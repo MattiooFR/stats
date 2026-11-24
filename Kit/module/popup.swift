@@ -11,6 +11,9 @@
 
 import Cocoa
 
+// the popup has no header anymore: the module shortcuts live in the bar at the bottom of each popup
+private let popupHeaderHeight: CGFloat = 0
+
 public final class PopupCache<T> {
     public var value: T?
     public var initialized: Bool = false
@@ -158,6 +161,8 @@ public class PopupWindow: NSPanel, NSWindowDelegate {
         self.collectionBehavior = .moveToActiveSpace
         self.backgroundColor = .clear
         self.hasShadow = true
+        self.isMovable = false
+        self.appearance = NSAppearance(named: .darkAqua)
         self.setIsVisible(false)
         self.delegate = self
     }
@@ -188,7 +193,7 @@ internal class PopupViewController: NSViewController {
             x: 0,
             y: 0,
             width: Constants.Popup.width + (Constants.Popup.margins * 2),
-            height: Constants.Popup.height+Constants.Popup.headerHeight
+            height: Constants.Popup.height+popupHeaderHeight
         ), module: module)
         super.init(nibName: nil, bundle: nil)
     }
@@ -246,9 +251,9 @@ internal class PopupView: NSView {
     init(frame: NSRect, module: ModuleType) {
         self.header = HeaderView(frame: NSRect(
             x: 0,
-            y: frame.height - Constants.Popup.headerHeight,
+            y: frame.height - popupHeaderHeight,
             width: frame.width,
-            height: Constants.Popup.headerHeight
+            height: popupHeaderHeight
         ), module: module)
         self.body = NSScrollView(frame: NSRect(
             x: Constants.Popup.margins,
@@ -280,10 +285,22 @@ internal class PopupView: NSView {
         self.body.hasHorizontalScroller = false
         self.body.autohidesScrollers = true
         self.body.horizontalScrollElasticity = .none
+        // the scroll view now sits under the (hidden) title bar: no automatic inset
+        self.body.automaticallyAdjustsContentInsets = false
+        self.body.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        
+        self.wantsLayer = true
+        self.foreground.isHidden = true
+        self.header.isHidden = true
         
         self.addSubview(self.foreground, positioned: .below, relativeTo: .none)
         self.addSubview(self.header)
         self.addSubview(self.body)
+        self.applyTheme()
+    }
+    
+    private func applyTheme() {
+        self.layer?.backgroundColor = ISTheme.current.background.cgColor
     }
     
     required init?(coder: NSCoder) {
@@ -291,7 +308,7 @@ internal class PopupView: NSView {
     }
     
     override func updateLayer() {
-        self.background.layer?.backgroundColor = self.isDarkMode ? .clear : NSColor.white.cgColor
+        self.applyTheme()
     }
     
     fileprivate func setView(_ view: Popup_p?) {
@@ -300,7 +317,7 @@ internal class PopupView: NSView {
         var isScrollVisible: Bool = false
         var size: NSSize = NSSize(
             width: (view?.frame.width ?? Constants.Popup.width) + (Constants.Popup.margins*2),
-            height: (view?.frame.height ?? 0) + Constants.Popup.headerHeight + (Constants.Popup.margins*2)
+            height: (view?.frame.height ?? 0) + popupHeaderHeight + (Constants.Popup.margins*2)
         )
         
         self.windowHeight = NSScreen.main?.visibleFrame.height // for height recalculate when appear/disappear
@@ -317,7 +334,7 @@ internal class PopupView: NSView {
         self.foreground.setFrameSize(size)
         self.background.setFrameSize(size)
         self.resizeBody(size, scrollVisible: isScrollVisible)
-        self.header.setFrameOrigin(NSPoint(x: 0, y: size.height - Constants.Popup.headerHeight))
+        self.header.setFrameOrigin(NSPoint(x: 0, y: size.height - popupHeaderHeight))
         
         if let view = view {
             self.body.documentView = view
@@ -336,6 +353,7 @@ internal class PopupView: NSView {
     }
     
     internal func appear() {
+        self.applyTheme()
         self.view?.appear()
         
         self.display()
@@ -352,6 +370,7 @@ internal class PopupView: NSView {
         }
     }
     internal func disappear() {
+        ISDetailController.shared.close()
         self.header.setCloseButton(false)
         self.view?.disappear()
         (self.view as? PopupWrapper)?.releaseContent()
@@ -361,7 +380,7 @@ internal class PopupView: NSView {
         var isScrollVisible: Bool = false
         var windowSize: NSSize = NSSize(
             width: size.width + (Constants.Popup.margins*2),
-            height: size.height + Constants.Popup.headerHeight + (Constants.Popup.margins*2)
+            height: size.height + popupHeaderHeight + (Constants.Popup.margins*2)
         )
         let h0 = self.containerHeight ?? 0
         
@@ -400,7 +419,7 @@ internal class PopupView: NSView {
             x: Constants.Popup.margins - (isRTL ? offset : 0),
             y: Constants.Popup.margins,
             width: windowSize.width - (Constants.Popup.margins*2) + offset,
-            height: windowSize.height - Constants.Popup.headerHeight - (Constants.Popup.margins*2)
+            height: windowSize.height - popupHeaderHeight - (Constants.Popup.margins*2)
         )
     }
 }

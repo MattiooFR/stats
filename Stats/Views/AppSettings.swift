@@ -14,7 +14,7 @@ import Kit
 
 class ApplicationSettings: NSStackView {
     private var updateIntervalValue: String {
-        Store.shared.string(key: "update-interval", defaultValue: AppUpdateInterval.silent.rawValue)
+        Store.shared.string(key: "update-interval", defaultValue: AppUpdateInterval.never.rawValue)
     }
     
     private var temperatureUnitsValue: String {
@@ -118,6 +118,11 @@ class ApplicationSettings: NSStackView {
                 action: #selector(self.toggleTemperatureUnits),
                 items: TemperatureUnits,
                 selected: self.temperatureUnitsValue
+            )),
+            PreferencesRow(isL("Popup theme", fr: "Thème des menus"), component: self.selectView(
+                action: #selector(self.togglePopupTheme),
+                items: ISTheme.all.map({ KeyValue_t(key: $0.key, value: $0.name) }),
+                selected: ISTheme.current.key
             )),
             PreferencesRow(localizedString("Show icon in dock"), component: self.switchView(
                 action: #selector(self.toggleDock),
@@ -367,6 +372,11 @@ class ApplicationSettings: NSStackView {
     @objc private func toggleUpdateInterval(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         Store.shared.set(key: "update-interval", value: key)
+    }
+    
+    @objc private func togglePopupTheme(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        Store.shared.set(key: ISTheme.storeKey, value: key)
     }
     
     @objc private func toggleTemperatureUnits(_ sender: NSMenuItem) {

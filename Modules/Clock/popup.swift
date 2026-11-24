@@ -10,7 +10,22 @@
 //
 
 import Cocoa
+import EventKit
 import Kit
+
+private struct DayEvent {
+    let title: String
+    let color: NSColor
+    let start: Date
+    let end: Date
+    let allDay: Bool
+}
+
+private enum EventsAccess {
+    case undetermined
+    case granted
+    case refused
+}
 
 internal class Popup: PopupWrapper {
     private lazy var orderTableView: OrderTableView = OrderTableView()
@@ -18,35 +33,283 @@ internal class Popup: PopupWrapper {
     private var list: [Clock_t] = []
     private let cache = PopupCache<[Clock_t]>()
     
-    private var calendarView: CalendarView? = nil
     private var calendarState: Bool = true
-    private var weekNumbersState: Bool = false
+    
+    // views, rebuilt each time the popup opens
+    private var monthView: MonthView? = nil
+    private var eventsCard: ISCard? = nil
+    private var shortcutBar: NSView? = nil
+    private var clockCards: [ClockCard] = []
+    private var loading: Bool = false
+    
+    // calendar events of the selected day
+    private lazy var eventStore: EKEventStore = EKEventStore()
+    private let eventsQueue = DispatchQueue(label: "eu.exelban.Stats.Clock.events", qos: .userInitiated)
+    private var eventsToken: Int = 0
+    private var todayEvents: (day: Date, list: [DayEvent])? = nil
+    private var selectedDay: Date = Calendar.current.startOfDay(for: Date())
+    private let maxEvents: Int = 8
     
     public init(_ module: ModuleType) {
-        super.init(module, frame: NSRect(x: 0, y: 0, width: Constants.Popup.width, height: 0))
+        super.init(module, frame: NSRect(x: 0, y: 0, width: 285, height: 0))
         
+        self.spacing = ISMetrics.spacing
         self.orientation = .vertical
-        self.spacing = Constants.Popup.margins
         
         self.calendarState = Store.shared.bool(key: "\(self.title)_calendar", defaultValue: self.calendarState)
-        self.weekNumbersState = Store.shared.bool(key: "\(self.title)_calendarWeekNumbers", defaultValue: self.weekNumbersState)
-    }
-    
-    public override func loadContent() {
-        self.calendarView = CalendarView(self.frame.width, showWeekNumbers: self.weekNumbersState)
-        if let calendar = self.calendarView, self.calendarState {
-            self.addArrangedSubview(calendar)
-        }
-        self.recalculateHeight()
-    }
-    
-    public override func unloadContent() {
-        self.calendarView = nil
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+    
+    public override func loadContent() {
+        self.loading = true
+        self.selectedDay = Calendar.current.startOfDay(for: Date())
+        
+        if self.calendarState {
+            self.addSection(self.initCalendar())
+            self.addSection(self.initEvents())
+        }
+        
+        let bar = ISShortcutBar(module: .clock, extra: [
+            ISShortcut.app("com.apple.iCal"),
+            ISShortcut.link(
+                "x-apple.systempreferences:com.apple.Date-Time-Settings.extension",
+                symbol: "clock",
+                toolTip: isL("Date & Time", fr: "Date et heure")
+            )
+        ])
+        self.addSection(bar)
+        self.shortcutBar = bar
+        
+        // the clock list is known before the first reading: the cards are there as soon as the popup opens
+        self.renderClocks(self.cache.value ?? self.currentList())
+        if self.calendarState {
+            self.reloadEvents()
+        }
+        
+        self.loading = false
+        self.resizeToFitContent()
+    }
+    
+    public override func unloadContent() {
+        self.monthView = nil
+        self.eventsCard = nil
+        self.shortcutBar = nil
+        self.clockCards = []
+        // a fetch that is still running must not touch the next set of views
+        self.eventsToken += 1
+    }
+    
+    public override func appear() {
+        self.replay(self.cache, render: self.renderClocks)
+    }
+    
+    private func fit() {
+        guard !self.loading else { return }
+        self.resizeToFitContent()
+    }
+    
+    // MARK: - Calendar
+    
+    private func initCalendar() -> NSView {
+        let card = ISCard()
+        // the view spans the whole card and insets its grid itself: the arrows sit near the edge and keep a full hit area
+        card.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 8, right: 0)
+        
+        let view = MonthView()
+        view.onSelect = { [weak self] day in
+            self?.selectedDay = day
+            self?.reloadEvents()
+        }
+        view.onResize = { [weak self] in
+            self?.fit()
+        }
+        view.onOpen = { [weak self] in
+            self?.openCalendar()
+        }
+        card.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalTo: card.widthAnchor).isActive = true
+        self.monthView = view
+        
+        return card
+    }
+    
+    private func openCalendar() {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.iCal") else { return }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        (self.window as? PopupWindow)?.dismissIfUnlocked()
+    }
+    
+    // MARK: - Events
+    
+    private func initEvents() -> NSView {
+        let card = ISCard()
+        self.eventsCard = card
+        return card
+    }
+    
+    // the permission is never asked automatically: only a click on the card asks for it
+    private var eventsAccess: EventsAccess {
+        let status = EKEventStore.authorizationStatus(for: .event)
+        if status == .notDetermined {
+            // without the usage description in Info.plist the request cannot succeed: it is not offered
+            return self.hasUsageDescription ? .undetermined : .refused
+        }
+        if #available(macOS 14.0, *) {
+            return status == .fullAccess ? .granted : .refused
+        }
+        return status == .authorized ? .granted : .refused
+    }
+    
+    private var hasUsageDescription: Bool {
+        if #available(macOS 14.0, *) {
+            return Bundle.main.object(forInfoDictionaryKey: "NSCalendarsFullAccessUsageDescription") != nil
+        }
+        return Bundle.main.object(forInfoDictionaryKey: "NSCalendarsUsageDescription") != nil
+    }
+    
+    private func reloadEvents() {
+        guard self.contentLoaded, let card = self.eventsCard else { return }
+        let day = self.selectedDay
+        
+        switch self.eventsAccess {
+        case .undetermined:
+            self.eventsToken += 1
+            let row = ISRow(
+                isL("Show calendar events…", fr: "Afficher les évènements du calendrier…"),
+                icon: NSImage(systemSymbolName: "calendar", accessibilityDescription: nil)
+            )
+            row.labelField.textColor = ISTheme.current.value
+            self.setEventRows([row]) { [weak self] in
+                self?.requestEventsAccess()
+            }
+        case .refused:
+            self.eventsToken += 1
+            self.setEventRows(self.eventRows([], day: day))
+        case .granted:
+            if let cached = self.todayEvents, cached.day == day {
+                self.setEventRows(self.eventRows(cached.list, day: day))
+            } else if card.arrangedSubviews.isEmpty || card.onClick != nil {
+                self.setEventRows(self.eventRows([], day: day))
+            }
+            // otherwise the previous day stays on screen until the new one is read: no flicker
+            self.fetchEvents(day)
+        }
+    }
+    
+    private func requestEventsAccess() {
+        if #available(macOS 14.0, *) {
+            self.eventStore.requestFullAccessToEvents { [weak self] _, _ in
+                DispatchQueue.main.async {
+                    self?.reloadEvents()
+                }
+            }
+        } else {
+            self.eventStore.requestAccess(to: .event) { [weak self] _, _ in
+                DispatchQueue.main.async {
+                    self?.reloadEvents()
+                }
+            }
+        }
+    }
+    
+    private func fetchEvents(_ day: Date) {
+        let calendar = Calendar.current
+        guard let end = calendar.date(byAdding: .day, value: 1, to: day) else { return }
+        
+        self.eventsToken += 1
+        let token = self.eventsToken
+        let store = self.eventStore
+        let fallbackColor = ISTheme.current.blue
+        
+        self.eventsQueue.async { [weak self] in
+            let predicate = store.predicateForEvents(withStart: day, end: end.addingTimeInterval(-1), calendars: nil)
+            var list: [DayEvent] = []
+            for event in store.events(matching: predicate) {
+                guard event.status != .canceled, let from = event.startDate, let to = event.endDate else { continue }
+                // an event that ended at midnight belongs to the day before
+                guard from < end, to > day || from >= day else { continue }
+                list.append(DayEvent(
+                    title: event.title ?? "",
+                    color: event.calendar?.color ?? fallbackColor,
+                    start: from,
+                    end: to,
+                    allDay: event.isAllDay || (from <= day && to >= end.addingTimeInterval(-60))
+                ))
+            }
+            list.sort(by: { a, b in
+                if a.allDay != b.allDay { return a.allDay }
+                if a.start != b.start { return a.start < b.start }
+                return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+            })
+            
+            DispatchQueue.main.async {
+                guard let self, self.contentLoaded, token == self.eventsToken else { return }
+                if calendar.isDateInToday(day) {
+                    self.todayEvents = (day, list)
+                }
+                self.setEventRows(self.eventRows(list, day: day))
+            }
+        }
+    }
+    
+    private func eventRows(_ events: [DayEvent], day: Date) -> [NSView] {
+        let theme = ISTheme.current
+        var rows: [NSView] = []
+        
+        // the selected day is named when it is not today
+        if !Calendar.current.isDateInToday(day) {
+            let formatter = DateFormatter()
+            formatter.locale = Locale.current
+            formatter.setLocalizedDateFormatFromTemplate("EEEEdMMMM")
+            let row = ISRow(formatter.string(from: day).uppercased(with: Locale.current))
+            row.labelField.textColor = theme.title
+            rows.append(row)
+        }
+        
+        guard !events.isEmpty else {
+            let row = ISRow(isL("No Events", fr: "Aucun Évènement"))
+            row.labelField.textColor = theme.value
+            rows.append(row)
+            return rows
+        }
+        
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        
+        for event in events.prefix(self.maxEvents) {
+            let row = ISRow(event.title, color: event.color)
+            row.labelField.textColor = theme.value
+            row.valueField.textColor = theme.label
+            if !event.allDay {
+                // started the day before: the end time is what matters today
+                row.setPlain(event.start < day ? "→ \(formatter.string(from: event.end))" : formatter.string(from: event.start))
+            }
+            row.toolTip = event.title
+            rows.append(row)
+        }
+        if events.count > self.maxEvents {
+            let more = events.count - self.maxEvents
+            rows.append(ISRow(isL("\(more) more…", fr: more == 1 ? "1 autre…" : "\(more) autres…"), dim: true))
+        }
+        
+        return rows
+    }
+    
+    private func setEventRows(_ rows: [NSView], onClick: (() -> Void)? = nil) {
+        guard let card = self.eventsCard else { return }
+        card.removeAll(keepHeader: false)
+        rows.forEach { card.add($0) }
+        card.onClick = onClick
+        card.needsDisplay = true
+        self.fit()
+    }
+    
+    // MARK: - Clocks
     
     internal func callback(_ list: [Clock_t]) {
         if self.settingsLoaded && (list.count != self.orderTableView.list.count || self.orderTableView.window?.isVisible ?? false) {
@@ -55,36 +318,63 @@ internal class Popup: PopupWrapper {
         }
         
         self.list = list
-        self.apply(list, to: self.cache, render: self.render)
+        self.apply(list, to: self.cache, render: self.renderClocks)
     }
     
-    private func render(_ list: [Clock_t]) {
-        defer { self.recalculateHeight() }
-        
-        let sorted = list.sorted(by: { $0.popupIndex < $1.popupIndex }).filter({ $0.popupState })
-        var views = self.subviews.filter{ $0 is ClockView }.compactMap{ $0 as? ClockView }
-        
-        if sorted.count < views.count && !views.isEmpty {
-            views.forEach{ $0.removeFromSuperview() }
-            views = []
+    private func currentList() -> [Clock_t] {
+        let now = Date()
+        return Clock.list.map { item in
+            var clock = item
+            clock.value = now
+            return clock
         }
+    }
+    
+    private func renderClocks(_ list: [Clock_t]) {
+        guard self.contentLoaded else { return }
         
-        sorted.forEach { (c: Clock_t) in
-            if let view = views.first(where: { $0.clock.id == c.id }) {
-                view.update(c)
-            } else {
-                self.addArrangedSubview(ClockView(width: self.frame.width, clock: c))
+        // same rules as before: the order and the visibility come from the list in the popup settings
+        var ordered: [(offset: Int, index: Int, clock: Clock_t)] = []
+        for (offset, clock) in list.enumerated() where clock.popupState {
+            ordered.append((offset: offset, index: clock.popupIndex, clock: clock))
+        }
+        ordered.sort { a, b in
+            if a.index != b.index { return a.index < b.index }
+            return a.offset < b.offset
+        }
+        let visible: [Clock_t] = ordered.map { $0.clock }
+        let visibleIDs: [String] = visible.map { $0.id }
+        let shownIDs: [String] = self.clockCards.map { $0.clock.id }
+        
+        if visibleIDs != shownIDs {
+            self.clockCards.forEach { card in
+                self.removeArrangedSubview(card)
+                card.removeFromSuperview()
             }
+            self.clockCards = visible.map { ClockCard($0, width: self.frame.width) }
+            
+            var index = self.arrangedSubviews.count
+            if let bar = self.shortcutBar, let position = self.arrangedSubviews.firstIndex(of: bar) {
+                index = position
+            }
+            self.clockCards.forEach { card in
+                self.addSection(card, at: index)
+                index += 1
+            }
+            self.fit()
         }
+        
+        for (card, clock) in zip(self.clockCards, visible) {
+            card.update(clock)
+        }
+        self.monthView?.refreshToday()
     }
     
-    private func recalculateHeight() {
-        let h = self.arrangedSubviews.map({ $0.fittingSize.height + self.spacing }).reduce(0, +) - self.spacing
-        if h > 0 && self.frame.size.height != h {
-            self.setFrameSize(NSSize(width: self.frame.width, height: h))
-            self.sizeCallback?(self.frame.size)
-        }
+    private func rearrange() {
+        self.callback(self.list)
     }
+    
+    // MARK: - Settings
     
     public override func settings() -> NSView? {
         self.settingsLoaded = true
@@ -106,10 +396,6 @@ internal class Popup: PopupWrapper {
             PreferencesRow(localizedString("Calendar"), component: self.switchView(
                 action: #selector(self.toggleCalendarState),
                 state: self.calendarState
-            )),
-            PreferencesRow(localizedString("Show week numbers"), component: self.switchView(
-                action: #selector(self.toggleWeekNumbersState),
-                state: self.weekNumbersState
             ))
         ]))
         
@@ -118,481 +404,697 @@ internal class Popup: PopupWrapper {
         return view
     }
     
-    public override func appear() {
-        if self.calendarState {
-            self.calendarView?.checkCurrentDay()
-        }
-        self.cache.replay(render: self.render)
-        self.subviews.compactMap { $0 as? ClockView }.forEach { $0.appear() }
-    }
-    
-    private func rearrange() {
-        let views = self.subviews.filter{ $0 is ClockView }.compactMap{ $0 as? ClockView }
-        views.forEach{ $0.removeFromSuperview() }
-        self.callback(self.list)
-    }
-    
     @objc private func toggleCalendarState(_ sender: NSControl) {
         self.calendarState = controlState(sender)
         Store.shared.set(key: "\(self.title)_calendar", value: self.calendarState)
         
-        guard let view = self.calendarView else { return }
-        if self.calendarState {
-            self.insertArrangedSubview(view, at: 0)
-        } else {
-            view.removeFromSuperview()
-        }
-        self.recalculateHeight()
-    }
-    
-    @objc private func toggleWeekNumbersState(_ sender: NSControl) {
-        self.weekNumbersState = controlState(sender)
-        Store.shared.set(key: "\(self.title)_calendarWeekNumbers", value: self.weekNumbersState)
-        self.calendarView?.setShowWeekNumbers(self.weekNumbersState)
-        self.recalculateHeight()
+        guard self.contentLoaded else { return }
+        self.releaseContent()
+        self.prepareForDisplay()
     }
 }
 
-private class CalendarView: NSStackView {
-    private var itemSize: CGSize
-    private var showWeekNumbers: Bool
-    private var navigationHeightConstraint: NSLayoutConstraint?
-    
-    private var year: Int
-    private var month: Int
-    private var day: Int
-    
-    private var currentYear: Int {
-        Calendar.current.component(.year, from: Date())
-    }
-    private var currentMonth: Int {
-        Calendar.current.component(.month, from: Date())
-    }
-    private var currentDay: Int {
-        Calendar.current.component(.day, from: Date())
+// month grid: month and year with previous / next, weekday names, one rounded cell per day
+private final class MonthView: NSView {
+    private enum Zone: Equatable {
+        case outside
+        case title
+        case previous
+        case next
+        case day(Int)
     }
     
-    private var weekDays: [String] {
-        let calendar = Calendar.current
-        let firstWeekdayIndex = calendar.firstWeekday - 1
-        let dateFormatter = DateFormatter()
-        dateFormatter.locale = Locale.current
-        dateFormatter.calendar = calendar
-        let weekdaySymbols = dateFormatter.shortWeekdaySymbols
-        return Array(weekdaySymbols![firstWeekdayIndex...]) + weekdaySymbols![..<firstWeekdayIndex]
+    public var onSelect: ((Date) -> Void)?
+    public var onResize: (() -> Void)?
+    public var onOpen: (() -> Void)?
+    
+    private let calendar: Calendar = Calendar.current
+    private var month: Date
+    private var today: Date
+    private var selected: Date
+    
+    private var days: [Date] = []
+    private var numbers: [String] = []
+    private var inMonth: [Bool] = []
+    private var title: String = ""
+    
+    private var hovered: Zone = .outside {
+        didSet {
+            if oldValue != self.hovered { self.needsDisplay = true }
+        }
     }
+    private var pressed: Zone = .outside
+    private var tracking: NSTrackingArea? = nil
+    private var heightConstraint: NSLayoutConstraint? = nil
+    private var toolTipsSize: NSSize = .zero
     
-    private var grid: NSGridView = NSGridView()
-    private var current: NSTextField = NSTextField()
+    private let headerHeight: CGFloat = 22
+    private let weekdayTop: CGFloat = 24
+    private let weekdayHeight: CGFloat = 20
+    private let gridTop: CGFloat = 47
+    private let cellHeight: CGFloat = 29
+    private let gap: CGFloat = 4
+    private let radius: CGFloat = 6
+    private let inset: CGFloat = ISMetrics.padH
     
-    init(_ width: CGFloat, showWeekNumbers: Bool) {
-        self.showWeekNumbers = showWeekNumbers
-        self.itemSize = NSSize.zero
-        self.year = Calendar.current.component(.year, from: Date())
-        self.month = Calendar.current.component(.month, from: Date())
-        self.day = Calendar.current.component(.day, from: Date())
+    private let titleFont: NSFont = NSFont.systemFont(ofSize: 13, weight: .medium)
+    private let weekdayFont: NSFont = NSFont.systemFont(ofSize: 10, weight: .regular)
+    private let numberFont: NSFont = ISFont.value(13)
+    
+    private lazy var titleFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.calendar = self.calendar
+        formatter.setLocalizedDateFormatFromTemplate("yMMMM")
+        return formatter
+    }()
+    private lazy var dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.calendar = self.calendar
+        formatter.dateStyle = .full
+        formatter.timeStyle = .none
+        return formatter
+    }()
+    // names in the order of the week, starting with the first weekday of the locale
+    private lazy var weekdays: (short: [String], narrow: [String]) = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.calendar = self.calendar
+        let first = self.calendar.firstWeekday - 1
+        let ordered: ([String]?) -> [String] = { symbols in
+            guard let symbols, symbols.count == 7, (0..<7).contains(first) else {
+                return Array(repeating: "", count: 7)
+            }
+            return (Array(symbols[first...]) + Array(symbols[..<first])).map { $0.uppercased(with: Locale.current) }
+        }
+        return (ordered(formatter.shortStandaloneWeekdaySymbols), ordered(formatter.veryShortStandaloneWeekdaySymbols))
+    }()
+    
+    override var isFlipped: Bool { true }
+    
+    init() {
+        let now = Calendar.current.startOfDay(for: Date())
+        self.month = now
+        self.today = now
+        self.selected = now
         
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: width - 32))
-        self.setAccessibilityElement(true)
+        super.init(frame: .zero)
+        self.translatesAutoresizingMaskIntoConstraints = false
         
-        self.spacing = 0
-        self.orientation = .vertical
-        self.edgeInsets = .init(
-            top: Constants.Popup.margins,
-            left: Constants.Popup.margins,
-            bottom: Constants.Popup.margins,
-            right: Constants.Popup.margins
-        )
-        self.wantsLayer = true
-        self.layer?.cornerRadius = Constants.Popup.radius
+        let height = self.heightAnchor.constraint(equalToConstant: self.gridTop)
+        height.isActive = true
+        self.heightConstraint = height
         
-        self.updateItemSize()
-        self.addArrangedSubview(self.navigation())
-        self.setup()
+        self.show(now)
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
-    public func checkCurrentDay() {
-        guard self.day != self.currentDay || self.month != self.currentMonth || self.year != self.currentYear else { return }
-        
-        self.year = self.currentYear
-        self.month = self.currentMonth
-        self.day = self.currentDay
-        
-        self.setup()
-    }
+    // MARK: - State
     
-    public func setShowWeekNumbers(_ state: Bool) {
-        guard self.showWeekNumbers != state else { return }
-        self.showWeekNumbers = state
-        self.updateItemSize()
-        self.setup()
-    }
-    
-    override func updateLayer() {
-        self.layer?.backgroundColor = (self.isDarkMode ? NSColor(red: 17/255, green: 17/255, blue: 17/255, alpha: 0.25) : NSColor(red: 245/255, green: 245/255, blue: 245/255, alpha: 1)).cgColor
-    }
-    
-    private func setup() {
-        self.grid.removeFromSuperview()
+    // displays the month that contains the date; the height follows the number of weeks
+    private func show(_ date: Date) {
+        let calendar = self.calendar
+        let start = calendar.date(from: calendar.dateComponents([.era, .year, .month], from: date)) ?? date
+        guard let range = calendar.range(of: .day, in: .month, for: start) else { return }
         
-        let grid = NSGridView()
-        grid.rowSpacing = 0
-        grid.columnSpacing = 0
-        
-        var headerRow: [NSView] = []
-        if self.showWeekNumbers {
-            headerRow.append(self.weekNumberHeaderItem())
-        }
-        headerRow.append(contentsOf: self.weekDays.map { self.headerItem($0) })
-        grid.addRow(with: headerRow)
-        
-        let weeks = self.generateDays(for: self.month, in: self.year)
-        for week in weeks {
-            var labels: [NSView] = []
-            if self.showWeekNumbers {
-                labels.append(self.weekNumberItem(week))
+        let lead = (calendar.component(.weekday, from: start) - calendar.firstWeekday + 7) % 7
+        let rows = Int((Double(lead + range.count) / 7).rounded(.up))
+        var days: [Date] = []
+        for i in 0..<(rows * 7) {
+            if let day = calendar.date(byAdding: .day, value: i - lead, to: start) {
+                days.append(day)
             }
-            labels.append(contentsOf: week.map { self.rowItem($0) })
-            grid.addRow(with: labels)
         }
+        guard rows > 0, days.count == rows * 7 else { return }
         
-        self.grid = grid
-        self.current.stringValue = "\(Calendar.current.standaloneMonthSymbols[self.month-1]) \(self.year)"
+        let before = self.days.count
+        self.month = start
+        self.days = days
+        self.numbers = days.map { "\(calendar.component(.day, from: $0))" }
+        self.inMonth = days.map { calendar.isDate($0, equalTo: start, toGranularity: .month) }
+        self.title = self.titleFormatter.string(from: start).uppercased(with: Locale.current)
         
-        self.addArrangedSubview(grid)
+        self.heightConstraint?.constant = self.gridTop + (CGFloat(rows) * self.cellHeight) + (CGFloat(rows - 1) * self.gap)
+        self.updateToolTips()
+        self.updateHover()
+        self.needsDisplay = true
+        
+        if before != 0 && before != days.count {
+            self.onResize?()
+        }
     }
     
-    private func navigation() -> NSView {
-        let view = NSStackView()
-        view.distribution = .fill
-        view.alignment = .centerY
-        self.navigationHeightConstraint = view.heightAnchor.constraint(greaterThanOrEqualToConstant: max(self.itemSize.height, 24))
-        self.navigationHeightConstraint?.isActive = true
-        view.orientation = .horizontal
-        view.edgeInsets = .init(top: 0, left: 6, bottom: 6, right: 6)
-        
-        let details = NSTextField(labelWithString: "\(Calendar.current.standaloneMonthSymbols[self.month-1]) \(self.year)")
-        details.font = .systemFont(ofSize: 15, weight: .medium)
-        details.lineBreakMode = .byTruncatingTail
-        details.maximumNumberOfLines = 1
-        details.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        self.current = details
-        let buttons = NSStackView()
-        buttons.orientation = .horizontal
-        buttons.setContentCompressionResistancePriority(.required, for: .horizontal)
-        
-        let prev = NSButton()
-        prev.bezelStyle = .regularSquare
-        prev.translatesAutoresizingMaskIntoConstraints = false
-        prev.imageScaling = .scaleNone
-        prev.image = iconFromSymbol(name: "arrow.left", scale: .medium)
-        prev.contentTintColor = .labelColor
-        prev.isBordered = false
-        prev.action = #selector(self.prevMonth)
-        prev.target = self
-        prev.toolTip = localizedString("Previous month")
-        prev.focusRingType = .none
-        
-        let next = NSButton()
-        next.bezelStyle = .regularSquare
-        next.translatesAutoresizingMaskIntoConstraints = false
-        next.imageScaling = .scaleNone
-        next.image = iconFromSymbol(name: "arrow.right", scale: .medium)
-        next.contentTintColor = .labelColor
-        next.isBordered = false
-        next.action = #selector(self.nextMonth)
-        next.target = self
-        next.toolTip = localizedString("Next month")
-        next.focusRingType = .none
-        
-        buttons.addArrangedSubview(prev)
-        buttons.addArrangedSubview(next)
-        
-        view.addArrangedSubview(details)
-        view.addArrangedSubview(NSView())
-        view.addArrangedSubview(buttons)
-        
-        return view
+    private func shift(_ months: Int) {
+        guard let date = self.calendar.date(byAdding: .month, value: months, to: self.month) else { return }
+        self.show(date)
     }
     
-    private func updateItemSize() {
-        let columns: CGFloat = self.showWeekNumbers ? 8 : 7
-        self.itemSize = NSSize(
-            width: (self.frame.width-(Constants.Popup.margins*2))/columns,
-            height: (self.frame.width-(Constants.Popup.spacing*2))/8 - 4
+    private func select(_ date: Date) {
+        let day = self.calendar.startOfDay(for: date)
+        let changed = !self.calendar.isDate(day, inSameDayAs: self.selected)
+        self.selected = day
+        if !self.calendar.isDate(day, equalTo: self.month, toGranularity: .month) {
+            self.show(day)
+        }
+        self.needsDisplay = true
+        if changed {
+            self.onSelect?(day)
+        }
+    }
+    
+    // called every second by the popup: follows the date when the day changes while the popup is open
+    public func refreshToday() {
+        let now = self.calendar.startOfDay(for: Date())
+        guard !self.calendar.isDate(now, inSameDayAs: self.today) else { return }
+        let followed = self.calendar.isDate(self.selected, inSameDayAs: self.today)
+        self.today = now
+        if followed {
+            self.select(now)
+        }
+        self.needsDisplay = true
+    }
+    
+    // MARK: - Geometry
+    
+    private var cellWidth: CGFloat {
+        (self.bounds.width - (self.inset * 2) - (self.gap * 6)) / 7
+    }
+    
+    private func cellRect(_ index: Int) -> NSRect {
+        NSRect(
+            x: self.inset + (CGFloat(index % 7) * (self.cellWidth + self.gap)),
+            y: self.gridTop + (CGFloat(index / 7) * (self.cellHeight + self.gap)),
+            width: self.cellWidth,
+            height: self.cellHeight
         )
-        self.navigationHeightConstraint?.constant = max(self.itemSize.height, 24)
     }
     
-    private func headerItem(_ value: String) -> NSView {
-        let view = NSTextField()
-        let cell = VerticallyCenteredTextFieldCell(textCell: value)
-        view.cell = cell
-        view.alignment = .center
-        view.textColor = .gray
-        view.font = .systemFont(ofSize: 10, weight: .medium)
-        view.widthAnchor.constraint(equalToConstant: self.itemSize.width).isActive = true
-        view.heightAnchor.constraint(equalToConstant: self.itemSize.height).isActive = true
-        return view
+    // the arrows are centered 34 and 10 pt from the right edge of the card
+    private var previousRect: NSRect {
+        NSRect(x: self.bounds.width - 46, y: 0, width: 24, height: self.headerHeight)
     }
     
-    private func rowItem(_ day: DateComponents) -> NSView {
-        let isToday = day.year == self.currentYear && day.month == self.currentMonth && day.day == self.currentDay
-        return CalendarItemView(day, size: self.itemSize, isToday: isToday, isOutOfMonth: day.month != self.month)
+    private var nextRect: NSRect {
+        NSRect(x: self.bounds.width - 22, y: 0, width: 22, height: self.headerHeight)
     }
     
-    private func weekNumberHeaderItem() -> NSView {
-        let view = NSTextField()
-        let cell = VerticallyCenteredTextFieldCell(textCell: "")
-        view.cell = cell
-        view.alignment = .center
-        view.textColor = .secondaryLabelColor
-        view.font = .systemFont(ofSize: 10, weight: .medium)
-        view.widthAnchor.constraint(equalToConstant: self.itemSize.width).isActive = true
-        view.heightAnchor.constraint(equalToConstant: self.itemSize.height).isActive = true
-        self.addRightBorder(view)
-        return view
+    private var titleRect: NSRect {
+        let width = (self.title as NSString).size(withAttributes: [.font: self.titleFont]).width + 16
+        return NSRect(x: (self.bounds.width - width) / 2, y: 0, width: width, height: self.headerHeight)
     }
     
-    private func weekNumberItem(_ week: [DateComponents]) -> NSView {
-        let calendar = Calendar.current
-        let firstDate = week.compactMap { calendar.date(from: $0) }.first ?? Date()
-        let weekNumber = calendar.component(.weekOfYear, from: firstDate)
+    private func zone(at point: NSPoint) -> Zone {
+        guard self.bounds.contains(point) else { return .outside }
         
-        let view = NSTextField()
-        let cell = VerticallyCenteredTextFieldCell(textCell: "\(weekNumber)")
-        view.cell = cell
-        view.alignment = .center
-        view.textColor = .secondaryLabelColor
-        view.font = .systemFont(ofSize: 10, weight: .medium)
-        view.widthAnchor.constraint(equalToConstant: self.itemSize.width).isActive = true
-        view.heightAnchor.constraint(equalToConstant: self.itemSize.height).isActive = true
-        self.addRightBorder(view)
-        return view
+        if point.y < self.headerHeight {
+            if self.nextRect.contains(point) { return .next }
+            if self.previousRect.contains(point) { return .previous }
+            if self.titleRect.contains(point) { return .title }
+            return .outside
+        }
+        guard point.y >= self.gridTop, point.x >= self.inset, self.cellWidth > 0 else { return .outside }
+        
+        let column = Int((point.x - self.inset) / (self.cellWidth + self.gap))
+        let row = Int((point.y - self.gridTop) / (self.cellHeight + self.gap))
+        let index = (row * 7) + column
+        guard column < 7, self.days.indices.contains(index), self.cellRect(index).contains(point) else { return .outside }
+        return .day(index)
     }
     
-    private func addRightBorder(_ view: NSView) {
-        let border = NSView()
-        border.wantsLayer = true
-        let borderColor = self.isDarkMode
-            ? NSColor.white.withAlphaComponent(0.4)
-            : NSColor.separatorColor
-        border.layer?.backgroundColor = borderColor.cgColor
-        border.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(border)
+    // MARK: - Drawing
+    
+    private static func cellFill(_ theme: ISTheme) -> NSColor {
+        let color = theme.background.usingColorSpace(.sRGB) ?? theme.background
+        let luminance = (0.2126 * color.redComponent) + (0.7152 * color.greenComponent) + (0.0722 * color.blueComponent)
+        // a darker cell does not show on an almost black panel
+        return luminance < 0.08 ? NSColor.white.withAlphaComponent(0.07) : NSColor.black.withAlphaComponent(0.1)
+    }
+    
+    override func draw(_ dirtyRect: NSRect) {
+        let theme = ISTheme.current
+        let width = self.bounds.width
+        let cellWidth = self.cellWidth
+        guard width > 0, cellWidth > 0 else { return }
         
-        let lineWidth = 1 / (NSScreen.main?.backingScaleFactor ?? 1)
-        NSLayoutConstraint.activate([
-            border.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            border.topAnchor.constraint(equalTo: view.topAnchor),
-            border.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            border.widthAnchor.constraint(equalToConstant: lineWidth)
+        // month and year
+        let title = NSAttributedString(string: self.title, attributes: [
+            .font: self.titleFont,
+            .foregroundColor: theme.value
         ])
-    }
-    
-    private func generateDays(for month: Int, in year: Int) -> [[DateComponents]] {
-        let calendar = Calendar.current
-        let dateComponents = DateComponents(year: year, month: month)
+        let titleSize = title.size()
+        title.draw(at: NSPoint(
+            x: ((width - titleSize.width) / 2).rounded(),
+            y: ((self.headerHeight - titleSize.height) / 2).rounded()
+        ))
         
-        guard let firstDayOfMonth = calendar.date(from: dateComponents),
-              let range = calendar.range(of: .day, in: .month, for: firstDayOfMonth),
-              let firstWeekdayOfMonth = calendar.dateComponents([.weekday], from: firstDayOfMonth).weekday else {
-            return []
-        }
-        
-        let localeFirstWeekday = calendar.firstWeekday
-        let daysFromPreviousMonth = (firstWeekdayOfMonth - localeFirstWeekday + 7) % 7
-        
-        var previousMonthComponents = dateComponents
-        previousMonthComponents.month = (month == 1) ? 12 : month - 1
-        previousMonthComponents.year = (month == 1) ? year - 1 : year
-        
-        guard let previousMonthDate = calendar.date(from: previousMonthComponents),
-              let previousMonthRange = calendar.range(of: .day, in: .month, for: previousMonthDate) else {
-            return []
-        }
-        let lastDayOfPreviousMonth = previousMonthRange.upperBound - 1
-        
-        var nextMonthComponents = dateComponents
-        nextMonthComponents.month = (month == 12) ? 1 : month + 1
-        nextMonthComponents.year = (month == 12) ? year + 1 : year
-        
-        var weeks = [[DateComponents]]()
-        var currentWeek = [DateComponents]()
-        let validDaysFromPreviousMonth = min(daysFromPreviousMonth, lastDayOfPreviousMonth)
-        if validDaysFromPreviousMonth > 0 {
-            for day in (lastDayOfPreviousMonth - validDaysFromPreviousMonth + 1)...lastDayOfPreviousMonth {
-                var components = previousMonthComponents
-                components.day = day
-                currentWeek.append(components)
+        // previous / next month
+        let arrows: [(zone: Zone, rect: NSRect, left: Bool)] = [
+            (.previous, self.previousRect, true),
+            (.next, self.nextRect, false)
+        ]
+        for arrow in arrows {
+            let center = NSPoint(x: arrow.left ? arrow.rect.midX : arrow.rect.maxX - 10, y: arrow.rect.midY)
+            if self.hovered == arrow.zone {
+                theme.hover.withAlphaComponent(0.75).setFill()
+                NSBezierPath(roundedRect: NSRect(x: center.x - 9, y: center.y - 9, width: 18, height: 18), xRadius: 5, yRadius: 5).fill()
             }
+            self.drawChevron(at: center, left: arrow.left, color: theme.value)
         }
         
-        for day in range {
-            var components = dateComponents
-            components.day = day
-            currentWeek.append(components)
-            if currentWeek.count == 7 {
-                weeks.append(currentWeek)
-                currentWeek = []
-            }
+        // weekday names
+        var symbols = self.weekdays.short
+        if symbols.contains(where: { ($0 as NSString).size(withAttributes: [.font: self.weekdayFont]).width > cellWidth }) {
+            symbols = self.weekdays.narrow
         }
-        
-        var nextMonthDay = 1
-        while currentWeek.count < 7 {
-            var components = nextMonthComponents
-            components.day = nextMonthDay
-            currentWeek.append(components)
-            nextMonthDay += 1
-        }
-        weeks.append(currentWeek)
-        
-        if weeks.count < 6 {
-            currentWeek = []
-            for _ in 1...7 {
-                var components = nextMonthComponents
-                components.day = nextMonthDay
-                currentWeek.append(components)
-                nextMonthDay += 1
-            }
-            weeks.append(currentWeek)
-        }
-        
-        return weeks
-    }
-    
-    @objc private func prevMonth() {
-        self.month -= 1
-        if self.month < 1 {
-            self.month = 12
-            self.year -= 1
-        }
-        self.setup()
-    }
-    @objc private func nextMonth() {
-        self.month += 1
-        if self.month > 12 {
-            self.month = 1
-            self.year += 1
-        }
-        self.setup()
-    }
-}
-
-private class CalendarItemView: NSView {
-    private let components: DateComponents
-    private let isHoverable: Bool
-    
-    private let app = URL(fileURLWithPath: "/System/Applications/Calendar.app")
-    
-    init(_ components: DateComponents, size: NSSize, isToday: Bool, isOutOfMonth: Bool) {
-        self.components = components
-        self.isHoverable = !isToday
-        
-        super.init(frame: NSRect(x: 0, y: 0, width: size.width, height: size.height))
-        
-        self.wantsLayer = true
-        self.layer?.cornerRadius = 4
-        self.toolTip = self.formattedDate()
-        self.widthAnchor.constraint(equalToConstant: size.width).isActive = true
-        self.heightAnchor.constraint(equalToConstant: size.height).isActive = true
-        
-        let field = NSTextField()
-        field.translatesAutoresizingMaskIntoConstraints = false
-        let cell = VerticallyCenteredTextFieldCell(textCell: "\(components.day ?? 0)")
-        field.cell = cell
-        field.alignment = .center
-        
-        if isToday {
-            let circleSize: CGFloat = min(size.width, size.height) - 3
-            let circle = NSView()
-            circle.translatesAutoresizingMaskIntoConstraints = false
-            circle.wantsLayer = true
-            circle.layer?.backgroundColor = NSColor.systemRed.cgColor
-            circle.layer?.cornerRadius = circleSize/2
-            
-            field.textColor = .white
-            
-            self.addSubview(circle)
-            self.addSubview(field)
-            
-            NSLayoutConstraint.activate([
-                circle.widthAnchor.constraint(equalToConstant: circleSize),
-                circle.heightAnchor.constraint(equalToConstant: circleSize),
-                circle.centerXAnchor.constraint(equalTo: self.centerXAnchor),
-                circle.centerYAnchor.constraint(equalTo: self.centerYAnchor, constant: 0.5),
-                field.centerXAnchor.constraint(equalTo: self.centerXAnchor),
-                field.centerYAnchor.constraint(equalTo: self.centerYAnchor)
+        let weekdayColor = theme.value.withAlphaComponent(0.6)
+        for (i, symbol) in symbols.enumerated() {
+            let text = NSAttributedString(string: symbol, attributes: [
+                .font: self.weekdayFont,
+                .foregroundColor: weekdayColor
             ])
-        } else {
-            if isOutOfMonth {
-                field.textColor = .lightGray
-            }
-            self.addSubview(field)
-            NSLayoutConstraint.activate([
-                field.centerXAnchor.constraint(equalTo: self.centerXAnchor),
-                field.centerYAnchor.constraint(equalTo: self.centerYAnchor)
-            ])
+            let size = text.size()
+            text.draw(at: NSPoint(
+                x: (self.inset + (CGFloat(i) * (cellWidth + self.gap)) + ((cellWidth - size.width) / 2)).rounded(),
+                y: (self.weekdayTop + ((self.weekdayHeight - size.height) / 2)).rounded()
+            ))
         }
         
-        NSLayoutConstraint.activate([
-            field.widthAnchor.constraint(equalToConstant: size.width),
-            field.heightAnchor.constraint(equalToConstant: size.height)
-        ])
+        // days
+        let fill = MonthView.cellFill(theme)
+        let dimmed = theme.dim.withAlphaComponent(0.7)
+        for i in self.days.indices {
+            let rect = self.cellRect(i)
+            guard rect.intersects(dirtyRect) else { continue }
+            
+            let day = self.days[i]
+            let isToday = self.calendar.isDate(day, inSameDayAs: self.today)
+            let isSelected = self.calendar.isDate(day, inSameDayAs: self.selected)
+            let isHovered = self.hovered == .day(i)
+            let isInMonth = self.inMonth[i]
+            
+            let cell = NSBezierPath(roundedRect: rect, xRadius: self.radius, yRadius: self.radius)
+            fill.withAlphaComponent(fill.alphaComponent * (isInMonth || isToday ? 1 : 0.5)).setFill()
+            cell.fill()
+            if isToday {
+                theme.blue.withAlphaComponent(isHovered ? 0.42 : 0.3).setFill()
+                cell.fill()
+            } else if isHovered || isSelected {
+                theme.hover.withAlphaComponent(isHovered ? 0.75 : 0.55).setFill()
+                cell.fill()
+            }
+            
+            if isToday || isSelected {
+                let lineWidth: CGFloat = 1
+                let outline = NSBezierPath(
+                    roundedRect: rect.insetBy(dx: lineWidth / 2, dy: lineWidth / 2),
+                    xRadius: self.radius - (lineWidth / 2),
+                    yRadius: self.radius - (lineWidth / 2)
+                )
+                outline.lineWidth = lineWidth
+                (isToday ? theme.blue : theme.label.withAlphaComponent(0.7)).setStroke()
+                outline.stroke()
+            }
+            
+            let number = NSAttributedString(string: self.numbers[i], attributes: [
+                .font: self.numberFont,
+                .foregroundColor: (isInMonth || isToday) ? theme.value : dimmed
+            ])
+            let size = number.size()
+            number.draw(at: NSPoint(
+                x: (rect.minX + ((rect.width - size.width) / 2)).rounded(),
+                y: (rect.minY + ((rect.height - size.height) / 2)).rounded()
+            ))
+        }
     }
     
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
+    private func drawChevron(at center: NSPoint, left: Bool, color: NSColor) {
+        let w: CGFloat = left ? 2.5 : -2.5
+        let h: CGFloat = 4.75
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: center.x + w, y: center.y - h))
+        path.line(to: NSPoint(x: center.x - w, y: center.y))
+        path.line(to: NSPoint(x: center.x + w, y: center.y + h))
+        path.lineWidth = 1.25
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        color.setStroke()
+        path.stroke()
+    }
+    
+    // MARK: - Mouse
+    
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        self.pressed = self.zone(at: self.convert(event.locationInWindow, from: nil))
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        let zone = self.zone(at: self.convert(event.locationInWindow, from: nil))
+        let pressed = self.pressed
+        self.pressed = .outside
+        // the press and the release must be on the same target
+        guard zone != .outside, pressed == .outside || pressed == zone else { return }
+        
+        switch zone {
+        case .previous:
+            self.shift(-1)
+        case .next:
+            self.shift(1)
+        case .title:
+            self.today = self.calendar.startOfDay(for: Date())
+            self.select(self.today)
+        case .day(let index):
+            guard self.days.indices.contains(index) else { return }
+            if event.clickCount > 1 {
+                // nothing after this line: the popup closes and releases this view
+                self.onOpen?()
+                return
+            }
+            self.select(self.days[index])
+        case .outside:
+            break
+        }
     }
     
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        self.trackingAreas.forEach { self.removeTrackingArea($0) }
-        guard self.isHoverable else { return }
-        self.addTrackingArea(NSTrackingArea(
+        if let tracking = self.tracking {
+            self.removeTrackingArea(tracking)
+        }
+        let area = NSTrackingArea(
             rect: self.bounds,
-            options: [.mouseEnteredAndExited, .activeInActiveApp],
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil
-        ))
+        )
+        self.addTrackingArea(area)
+        self.tracking = area
     }
     
     override func mouseEntered(with event: NSEvent) {
-        guard self.isHoverable else { return }
-        self.layer?.backgroundColor = NSColor.gray.withAlphaComponent(0.2).cgColor
+        self.hovered = self.zone(at: self.convert(event.locationInWindow, from: nil))
+    }
+    
+    override func mouseMoved(with event: NSEvent) {
+        self.hovered = self.zone(at: self.convert(event.locationInWindow, from: nil))
     }
     
     override func mouseExited(with event: NSEvent) {
-        self.layer?.backgroundColor = .clear
+        self.hovered = .outside
     }
     
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !self.isHidden else { return nil }
-        return self.bounds.contains(self.convert(point, from: self.superview)) ? self : nil
-    }
-    
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            (self.window as? PopupWindow)?.dismissIfUnlocked()
-            NSWorkspace.shared.open([], withApplicationAt: self.app, configuration: NSWorkspace.OpenConfiguration())
+    private func updateHover() {
+        guard let window = self.window else {
+            self.hovered = .outside
             return
         }
-        guard let value = self.formattedDate() else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(value, forType: .string)
+        self.hovered = self.zone(at: self.convert(window.mouseLocationOutsideOfEventStream, from: nil))
     }
     
-    private func formattedDate() -> String? {
-        guard let date = Calendar.current.date(from: self.components) else { return nil }
+    // MARK: - Tooltips
+    
+    override func layout() {
+        super.layout()
+        if self.toolTipsSize != self.bounds.size {
+            self.updateToolTips()
+        }
+    }
+    
+    private func updateToolTips() {
+        self.removeAllToolTips()
+        self.toolTipsSize = self.bounds.size
+        guard self.bounds.width > 0 else { return }
+        
+        _ = self.addToolTip(self.titleRect, owner: self, userData: nil)
+        _ = self.addToolTip(self.previousRect, owner: self, userData: nil)
+        _ = self.addToolTip(self.nextRect, owner: self, userData: nil)
+        for i in self.days.indices {
+            _ = self.addToolTip(self.cellRect(i), owner: self, userData: nil)
+        }
+    }
+}
+
+extension MonthView: NSViewToolTipOwner {
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        switch self.zone(at: point) {
+        case .title:
+            return isL("Today", fr: "Aujourd’hui")
+        case .previous:
+            return localizedString("Previous month")
+        case .next:
+            return isL("Next month", fr: "Mois suivant")
+        case .day(let index):
+            return self.days.indices.contains(index) ? self.dayFormatter.string(from: self.days[index]) : ""
+        case .outside:
+            return ""
+        }
+    }
+}
+
+// one clock of the list: name and difference with the local time on the left, time in large digits on the right
+private final class ClockCard: ISCard {
+    private(set) var clock: Clock_t
+    
+    private let nameField: ISText
+    private let detailField: ISText
+    private let timeField: ISText
+    
+    // time of day part of the clock format, nil when the format has none
+    private var timeFormat: String?
+    private var timeSize: CGFloat = ClockCard.maxTimeSize
+    private var timeLength: Int = -1
+    private let maxTimeWidth: CGFloat
+    private var toolTipSize: NSSize = .zero
+    
+    private static let maxTimeSize: CGFloat = 30
+    private static let minTimeSize: CGFloat = 14
+    private static var formatters: [String: DateFormatter] = [:]
+    
+    init(_ clock: Clock_t, width: CGFloat) {
+        let theme = ISTheme.current
+        self.clock = clock
+        self.timeFormat = ClockCard.timeOnly(clock.format)
+        self.maxTimeWidth = ((width - (ISMetrics.padH * 2)) * 0.64).rounded()
+        self.nameField = ISText(clock.name, font: ISFont.label(13), color: theme.value)
+        self.detailField = ISText("", font: ISFont.label(13), color: theme.label)
+        self.timeField = ISText("", font: ClockCard.timeFont(ClockCard.maxTimeSize), color: theme.value, alignment: .right)
+        
+        super.init(title: nil, value: nil)
+        
+        let content = NSView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.heightAnchor.constraint(equalToConstant: 35).isActive = true
+        
+        self.nameField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.detailField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.timeField.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(751), for: .horizontal)
+        self.timeField.setContentHuggingPriority(.required, for: .horizontal)
+        
+        content.addSubview(self.nameField)
+        content.addSubview(self.detailField)
+        content.addSubview(self.timeField)
+        NSLayoutConstraint.activate([
+            self.nameField.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            self.nameField.centerYAnchor.constraint(equalTo: content.topAnchor, constant: 10),
+            self.detailField.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            self.detailField.centerYAnchor.constraint(equalTo: content.topAnchor, constant: 25),
+            self.timeField.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            self.timeField.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            self.nameField.trailingAnchor.constraint(lessThanOrEqualTo: self.timeField.leadingAnchor, constant: -8),
+            self.detailField.trailingAnchor.constraint(lessThanOrEqualTo: self.timeField.leadingAnchor, constant: -8)
+        ])
+        self.add(content)
+        
+        self.update(clock)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    public func update(_ clock: Clock_t) {
+        if clock.format != self.clock.format {
+            self.timeFormat = ClockCard.timeOnly(clock.format)
+        }
+        self.clock = clock
+        
+        let date = clock.value ?? Date()
+        let zone = TimeZone(from: clock.tz)
+        
+        if self.nameField.stringValue != clock.name {
+            self.nameField.stringValue = clock.name
+        }
+        
+        let time: String
+        if let format = self.timeFormat {
+            time = ClockCard.formatter(format, zone: zone).string(from: date)
+        } else {
+            time = clock.formatted()
+        }
+        if self.timeField.stringValue != time {
+            self.fit(time)
+            self.timeField.stringValue = time
+        }
+        
+        let detail = ClockCard.difference(with: zone, at: date)
+        if self.detailField.stringValue != detail {
+            self.detailField.stringValue = detail
+        }
+    }
+    
+    // a long value (a format without a time of day, seconds and AM/PM...) gets smaller digits instead of pushing the name out
+    private func fit(_ text: String) {
+        guard text.count != self.timeLength else { return }
+        self.timeLength = text.count
+        
+        var size = ClockCard.maxTimeSize
+        while size > ClockCard.minTimeSize {
+            let width = (text as NSString).size(withAttributes: [.font: ClockCard.timeFont(size)]).width
+            if width <= self.maxTimeWidth { break }
+            size -= 1
+        }
+        if size != self.timeSize {
+            self.timeSize = size
+            self.timeField.font = ClockCard.timeFont(size)
+        }
+    }
+    
+    private static func timeFont(_ size: CGFloat) -> NSFont {
+        NSFont.monospacedDigitSystemFont(ofSize: size, weight: .thin)
+    }
+    
+    private static func formatter(_ format: String, zone: TimeZone) -> DateFormatter {
+        let key = "\(zone.identifier)|\(format)"
+        if let formatter = ClockCard.formatters[key] {
+            return formatter
+        }
         let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.dateFormat = DateFormatter.dateFormat(fromTemplate: "yyyyMMdd", options: 0, locale: .current)
-        return formatter.string(from: date)
+        formatter.dateFormat = format
+        formatter.timeZone = zone
+        ClockCard.formatters[key] = formatter
+        return formatter
+    }
+    
+    // "yyyy-MM-dd HH:mm:ss" -> "HH:mm:ss": the large digits show the time, the calendar above shows the date
+    private static func timeOnly(_ format: String) -> String? {
+        enum Kind {
+            case time
+            case other
+            case literal
+        }
+        let timeFields: Set<Character> = ["a", "A", "b", "B", "h", "H", "k", "K", "m", "s", "S"]
+        let chars = Array(format)
+        var tokens: [(text: String, kind: Kind)] = []
+        
+        var i = 0
+        while i < chars.count {
+            let char = chars[i]
+            var j = i + 1
+            if char == "'" {
+                // quoted text, '' is a quote inside it
+                while j < chars.count {
+                    if chars[j] == "'" {
+                        if j + 1 < chars.count && chars[j + 1] == "'" {
+                            j += 2
+                            continue
+                        }
+                        break
+                    }
+                    j += 1
+                }
+                j = min(j + 1, chars.count)
+                tokens.append((String(chars[i..<j]), .literal))
+            } else if char.isASCII && char.isLetter {
+                while j < chars.count && chars[j] == char { j += 1 }
+                tokens.append((String(chars[i..<j]), timeFields.contains(char) ? .time : .other))
+            } else {
+                while j < chars.count && chars[j] != "'" && !(chars[j].isASCII && chars[j].isLetter) { j += 1 }
+                tokens.append((String(chars[i..<j]), .literal))
+            }
+            i = j
+        }
+        
+        guard let first = tokens.firstIndex(where: { $0.kind == .time }),
+              let last = tokens.lastIndex(where: { $0.kind == .time }) else {
+            return nil
+        }
+        
+        // a separator is kept only between two time fields
+        var result = ""
+        var separator = ""
+        var skipped = false
+        for token in tokens[first...last] {
+            switch token.kind {
+            case .time:
+                if !result.isEmpty {
+                    result += skipped ? " " : separator
+                }
+                result += token.text
+                separator = ""
+                skipped = false
+            case .literal:
+                separator += token.text
+            case .other:
+                skipped = true
+            }
+        }
+        return result
+    }
+    
+    private static func difference(with zone: TimeZone, at date: Date) -> String {
+        let seconds = zone.secondsFromGMT(for: date) - TimeZone.current.secondsFromGMT(for: date)
+        guard seconds != 0 else {
+            return isL("Same time", fr: "Même heure")
+        }
+        
+        let minutes = abs(seconds) / 60
+        let h = minutes / 60
+        let m = minutes % 60
+        let amount: String
+        if m == 0 {
+            amount = isL(h == 1 ? "1 hour" : "\(h) hours", fr: h == 1 ? "1 heure" : "\(h) heures")
+        } else if h == 0 {
+            amount = "\(m) minutes"
+        } else {
+            amount = isL("\(h) h \(m) min", fr: "\(h) h \(String(format: "%02d", m))")
+        }
+        var text = seconds > 0 ? isL("\(amount) ahead", fr: "\(amount) d’avance") : isL("\(amount) behind", fr: "\(amount) de retard")
+        
+        // the date is not the same over there: whole days between the two wall clocks
+        let stamp = date.timeIntervalSince1970
+        let remoteDay = ((stamp + Double(zone.secondsFromGMT(for: date))) / 86400).rounded(.down)
+        let localDay = ((stamp + Double(TimeZone.current.secondsFromGMT(for: date))) / 86400).rounded(.down)
+        let days = Int(remoteDay - localDay)
+        if days > 0 {
+            text = "\(isL("Tomorrow", fr: "Demain")), \(text)"
+        } else if days < 0 {
+            text = "\(isL("Yesterday", fr: "Hier")), \(text)"
+        }
+        return text
+    }
+    
+    // MARK: - Tooltip (the clock in its own format, as before)
+    
+    override func layout() {
+        super.layout()
+        if self.toolTipSize != self.bounds.size {
+            self.toolTipSize = self.bounds.size
+            self.removeAllToolTips()
+            _ = self.addToolTip(self.bounds, owner: self, userData: nil)
+        }
+    }
+}
+
+extension ClockCard: NSViewToolTipOwner {
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        "\(self.clock.name): \(self.clock.formatted())"
     }
 }
 
