@@ -149,6 +149,9 @@ public class ISText: NSTextField {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    // a side panel never becomes the key window: without this, a click on a text inside it would be dropped
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 public class ISDot: NSView {
@@ -304,6 +307,9 @@ open class ISCard: NSStackView {
         self.tracking = area
     }
 
+    // same reason as ISText: cards also live in side panels, which never are the key window
+    open override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     public override func mouseEntered(with event: NSEvent) {
         self.hovered = true
         if self.detail != nil {
@@ -396,6 +402,8 @@ public class ISRow: NSView {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     // "12,3 Go" is split automatically: digits in normal size, unit smaller
     public func set(_ value: String) {

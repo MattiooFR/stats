@@ -132,7 +132,6 @@ internal class Popup: PopupWrapper {
         if self.numberOfProcesses > 0 {
             self.addSection(self.initProcesses())
         }
-        self.addSection(self.initDetails())
         self.addSection(ISShortcutBar(module: .network, extra: [
             ISShortcut.link(
                 "x-apple.systempreferences:com.apple.Network-Settings.extension",
@@ -231,6 +230,13 @@ internal class Popup: PopupWrapper {
         row.valueField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         card.add(row)
         
+        // as in iStat Menus, the figures of the connection are not in the menu:
+        // they open next to it while the pointer is on this line
+        card.detailID = "details"
+        card.detail = { [weak self] in
+            self?.detailsPanel() ?? NSView()
+        }
+        
         self.interfaceCard = card
         self.interfaceRow = row
         
@@ -293,7 +299,17 @@ internal class Popup: PopupWrapper {
         return card
     }
     
-    // what Stats knows and the reference does not show
+    private func detailsPanel() -> NSView {
+        let stack = ISDetailStack(width: self.frame.width, ranges: false)
+        stack.add(self.initDetails())
+        if let value = self.usageCache.value {
+            _ = self.renderDetails(value)
+        }
+        self.locationRow?.setPlain(self.locationName)
+        return stack
+    }
+    
+    // totals since the last reset, location, DNS, MAC address, signal, channel, link speed
     private func initDetails() -> NSView {
         let theme = ISTheme.current
         let card = ISCard(title: localizedString("Details"))
@@ -1038,6 +1054,9 @@ private final class NetGlyphButton: NSButton {
     @objc private func fire() {
         self.handler()
     }
+    
+    // it also sits in a side panel, which never is the key window
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 // "Sent 195 KB/s" on the left, "Received 63 KB/s" on the right

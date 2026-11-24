@@ -88,6 +88,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                     module.debugHover(0, enter: false)
                     module.debugHover(1, enter: true)
                 }
+                // what a click would hit in each of the two panels
+                let dir = (path as NSString).deletingLastPathComponent
+                for (name, delay) in [("hits-1.txt", 3.8), ("hits-2.txt", 6.8)] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        try? ISDetailController.shared.debugHitReport().joined(separator: "\n")
+                            .write(toFile: "\(dir)/\(name)", atomically: true, encoding: .utf8)
+                    }
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 8) { module.debugHover(1, enter: false) }
             }
             // STATS_DEBUG_ONLY=<module>: only that popup is opened (what it shows of the other modules must still work)

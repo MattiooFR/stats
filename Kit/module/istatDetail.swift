@@ -948,6 +948,23 @@ public final class ISDetailController {
         return "range \(before.rawValue) -> \(ISRange.current.rawValue), panel became key: \(panel.isKeyWindow), popup still visible: \(panel.parent?.isVisible ?? false)"
     }
     
+    // review mode: which views would receive a click in the open panel, and whether they take it
+    // although the panel is not the key window (nothing is clicked)
+    public func debugHitReport() -> [String] {
+        guard let panel = self.panel, let content = panel.contentView else { return ["no panel open"] }
+        var seen: [String: Int] = [:]
+        var y: CGFloat = 4
+        while y < content.bounds.height {
+            for x in [0.1, 0.5, 0.94] {
+                if let view = content.hitTest(NSPoint(x: content.bounds.width * CGFloat(x), y: y)) {
+                    seen["\(type(of: view)) acceptsFirstMouse=\(view.acceptsFirstMouse(for: nil))", default: 0] += 1
+                }
+            }
+            y += 6
+        }
+        return seen.map({ "\($0.key) x\($0.value)" }).sorted()
+    }
+    
     // review mode: the panel of a card, opened on its own under the wallpaper and left open
     public func debugOpen(_ card: ISCard, at origin: NSPoint) -> Int? {
         guard let builder = card.detail else { return nil }
