@@ -11,6 +11,7 @@
 
 import Cocoa
 import Kit
+import SystemConfiguration
 
 internal class Popup: PopupWrapper {
     // (upload, download) in bytes per second, one point per usage callback
@@ -36,7 +37,20 @@ internal class Popup: PopupWrapper {
     
     private var totalUploadRow: ISRow? = nil
     private var totalDownloadRow: ISRow? = nil
-    private var connectivityRow: ISRow? = nil
+    private var locationRow: ISRow? = nil
+    
+    // VPN services known to macOS (Tailscale, WireGuard, IPSec…) and the network location: read while the popup is open
+    private var vpnCard: ISCard? = nil
+    private var vpnRows: [ISRow] = []
+    private var vpnServices: [NetVPNService] = []
+    private var networkLocation: String? = nil
+    private var systemReadAt: Date? = nil
+    private var systemReading: Bool = false
+    
+    private var pingCard: ISCard? = nil
+    private var pingChart: ISBarChart? = nil
+    // [latency in ms, lost (0 or 1), answered (0 or 1)], kept up to 30 days for the side panel
+    private let pingHistory = ISHistoryStore.shared.series("net.ping", dimensions: 3)
     private var dnsRow: ISRow? = nil
     private var macRow: ISRow? = nil
     private var signalRow: ISRow? = nil
@@ -109,6 +123,8 @@ internal class Popup: PopupWrapper {
     public override func loadContent() {
         self.addSection(self.initSpeed())
         self.addSection(self.initInterface())
+        self.addSection(self.initVPN())
+        self.addSection(self.initPing())
         if self.publicIPState {
             self.addSection(self.initPublicAddresses())
         }
@@ -142,7 +158,11 @@ internal class Popup: PopupWrapper {
         self.processes = nil
         self.totalUploadRow = nil
         self.totalDownloadRow = nil
-        self.connectivityRow = nil
+        self.locationRow = nil
+        self.vpnCard = nil
+        self.vpnRows = []
+        self.pingCard = nil
+        self.pingChart = nil
         self.dnsRow = nil
         self.macRow = nil
         self.signalRow = nil
@@ -154,6 +174,8 @@ internal class Popup: PopupWrapper {
         self.replay(self.usageCache, render: self.renderUsage)
         self.replay(self.connectivityCache, render: self.renderConnectivity)
         self.replay(self.processesCache, render: self.renderProcesses)
+        self.renderVPN()
+        self.refreshSystem(force: true)
     }
     
     // MARK: - Views
@@ -215,6 +237,35 @@ internal class Popup: PopupWrapper {
         return card
     }
     
+    // one line per VPN service: a lock, its name, and how long it has been connected
+    private func initVPN() -> NSView {
+        let card = ISCard()
+        card.isHidden = self.vpnServices.isEmpty
+        self.vpnCard = card
+        self.vpnRows = []
+        return card
+    }
+    
+    // latency of the connectivity check, with its last minute and a half as bars
+    private func initPing() -> NSView {
+        let card = ISCard(title: "Ping", value: "—")
+        let chart = ISBarChart(colors: [ISTheme.current.blue], height: 26)
+        chart.maxValue = nil
+        card.add(chart)
+        if let header = card.header {
+            card.setCustomSpacing(3, after: header)
+        }
+        card.edgeInsets.bottom = ISMetrics.padV + 2
+        card.isHidden = self.connectivityCheckDisabled
+        card.detailID = "ping"
+        card.detail = { [weak self] in
+            self?.pingDetail() ?? NSView()
+        }
+        self.pingCard = card
+        self.pingChart = chart
+        return card
+    }
+    
     private func initPublicAddresses() -> NSView {
         let list = NetAddressList(title: isL("Public IP addresses", fr: "Adresses IP publiques"), width: self.innerWidth)
         if let title = list.card.titleField {
@@ -261,8 +312,8 @@ internal class Popup: PopupWrapper {
         
         let totalUpload = ISRow(isL("Total sent", fr: "Total envoyé"), value: self.memory(0), color: theme.pink)
         let totalDownload = ISRow(isL("Total received", fr: "Total reçu"), value: self.memory(0), color: theme.blue)
-        let connectivity = ISRow(localizedString("Internet connection"), color: theme.track)
-        connectivity.setPlain("—")
+        let location = ISRow(isL("Location", fr: "Lieu"))
+        location.setPlain(self.locationName)
         let dns = ISRow(localizedString("DNS Server"))
         dns.setPlain("—")
         // an IPv6 server is cut in the middle, the label stays whole
@@ -285,11 +336,11 @@ internal class Popup: PopupWrapper {
             netCopy(self?.usageCache.value?.dns.joined(separator: ", "), flash: view)
         })
         
-        [totalUpload, totalDownload, connectivity, dns, mac, signal, channel, linkSpeed].forEach { card.add($0) }
+        [totalUpload, totalDownload, location, dns, mac, signal, channel, linkSpeed].forEach { card.add($0) }
         
         self.totalUploadRow = totalUpload
         self.totalDownloadRow = totalDownload
-        self.connectivityRow = connectivity
+        self.locationRow = location
         self.dnsRow = dns
         self.macRow = mac
         self.signalRow = signal
@@ -340,6 +391,136 @@ internal class Popup: PopupWrapper {
         return stack
     }
 
+    // side panel of the ping card: latency over time, losses, and the host that is checked
+    private func pingDetail() -> NSView {
+        let theme = ISTheme.current
+        let stack = ISDetailStack()
+        
+        let ping = ISHistoryCard(
+            title: "Ping",
+            series: self.pingHistory,
+            style: .lines,
+            colors: [theme.blue],
+            dims: [0],
+            height: 64
+        )
+        let average = ISRow(isL("Average", fr: "Moyenne"))
+        let peak = ISRow(isL("Peak", fr: "Pic"))
+        let lost = ISRow(isL("Lost", fr: "Pertes"))
+        let host = ISRow(isL("Host", fr: "Hôte"))
+        [average, peak, lost, host].forEach { ping.add($0) }
+        if Store.shared.string(key: "\(self.title)_connectivityMode", defaultValue: "icmp") == "http" {
+            host.setPlain(Store.shared.string(key: "\(self.title)_HTTPHost", defaultValue: "https://google.com"))
+        } else {
+            host.setPlain(Store.shared.string(key: "\(self.title)_ICMPHost", defaultValue: "1.1.1.1"))
+        }
+        host.labelField.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        host.valueField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        ping.summary = { _, points in
+            // the average only counts the checks that got an answer
+            let answered = points.isTotal(2) ?? 0
+            if answered > 0, let total = points.isTotal(0) {
+                let value = total / answered
+                average.set("\(isNumber(value, digits: value < 10 ? 1 : 0)) ms")
+            } else {
+                average.set("—")
+            }
+            peak.set(points.isMaximum(0).map({ "\(isNumber($0, digits: 0)) ms" }) ?? "—")
+            lost.set(points.isAverage(1).map({ "\(isNumber($0 * 100, digits: $0 > 0 && $0 < 0.1 ? 1 : 0))%" }) ?? "—")
+        }
+        stack.add(ping)
+        
+        stack.refresh()
+        return stack
+    }
+    
+    // MARK: - System state (VPN, location)
+    
+    private var locationName: String {
+        guard let name = self.networkLocation, !name.isEmpty else { return "—" }
+        return name == "Automatic" ? isL("Automatic", fr: "Automatique") : name
+    }
+    
+    private func lockIcon(_ connected: Bool) -> NSImage {
+        NSImage(systemSymbolName: connected ? "lock.fill" : "lock.open.fill", accessibilityDescription: nil)
+            ?? NSImage(size: NSSize(width: ISMetrics.icon, height: ISMetrics.icon))
+    }
+    
+    // "23h, 57m" as iStat Menus writes it
+    private func elapsed(since date: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        let days = seconds / 86400
+        let hours = (seconds % 86400) / 3600
+        let minutes = (seconds % 3600) / 60
+        if days > 0 {
+            return isL("\(days)d, \(hours)h", fr: "\(days)j, \(hours)h")
+        }
+        if hours > 0 {
+            return "\(hours)h, \(minutes)m"
+        }
+        return "\(minutes)m"
+    }
+    
+    // SystemConfiguration is asked on a background queue, at most every five seconds while the popup is open
+    private func refreshSystem(force: Bool = false) {
+        guard !self.systemReading else { return }
+        if !force, let at = self.systemReadAt, Date().timeIntervalSince(at) < 5 { return }
+        
+        self.systemReading = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let state = NetSystem.read()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.systemReading = false
+                self.systemReadAt = Date()
+                self.vpnServices = state.vpn
+                self.networkLocation = state.location
+                self.renderVPN()
+            }
+        }
+    }
+    
+    private func renderVPN() {
+        self.locationRow?.setPlain(self.locationName)
+        guard let card = self.vpnCard else { return }
+        let theme = ISTheme.current
+        var resized = false
+        
+        if self.vpnRows.count != self.vpnServices.count {
+            card.removeAll(keepHeader: false)
+            self.vpnRows = self.vpnServices.map { _ in
+                let row = ISRow("", icon: self.lockIcon(true))
+                // a long name is kept whole, the duration gives way
+                row.labelField.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+                row.valueField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                card.add(row)
+                return row
+            }
+            resized = true
+        }
+        
+        for (row, service) in zip(self.vpnRows, self.vpnServices) {
+            row.labelField.stringValue = service.name
+            row.iconView?.image = self.lockIcon(service.connected)
+            row.iconView?.contentTintColor = service.connected ? theme.blue : theme.dim
+            row.labelField.textColor = service.connected ? theme.value : theme.dim
+            row.valueField.textColor = service.connected ? theme.value : theme.dim
+            if service.connected {
+                row.setPlain(service.since.map { self.elapsed(since: $0) } ?? isL("Connected", fr: "Connecté"))
+            } else {
+                row.setPlain(isL("Not connected", fr: "Non connecté"))
+            }
+            self.setToolTip(row, service.interface)
+        }
+        
+        if self.setHidden(card, self.vpnServices.isEmpty) {
+            resized = true
+        }
+        if resized {
+            self.resizeToFitContent()
+        }
+    }
+    
     // MARK: - Formatting
     
     // same unit settings as the widgets (bits or bytes, fixed unit), with the local wording
@@ -467,6 +648,7 @@ internal class Popup: PopupWrapper {
         }
         
         self.renderInterface(value)
+        self.refreshSystem()
         let addresses = self.renderAddresses(value)
         let details = self.renderDetails(value)
         
@@ -630,6 +812,9 @@ internal class Popup: PopupWrapper {
     }
     
     public func connectivityCallback(_ value: Network_Connectivity?) {
+        if let value, !self.connectivityCheckDisabled {
+            self.pingHistory.record(value.status ? [value.latency, 0, 1] : [0, 1, 0])
+        }
         DispatchQueue.main.async {
             if self.latency.count >= 90 {
                 self.latency.removeFirst()
@@ -645,44 +830,50 @@ internal class Popup: PopupWrapper {
     }
     
     private func renderConnectivity(_ value: Network_Connectivity?) {
-        guard let row = self.connectivityRow else { return }
+        guard let card = self.pingCard else { return }
         let theme = ISTheme.current
         
-        guard let value, !self.connectivityCheckDisabled else {
-            row.dot?.color = theme.track
-            row.setPlain("—")
-            self.setToolTip(row, nil)
-            return
+        if self.setHidden(card, self.connectivityCheckDisabled) {
+            self.resizeToFitContent()
         }
-        guard value.status else {
-            row.dot?.color = theme.red
-            row.setPlain(isL("Offline", fr: "Hors ligne"))
-            self.setToolTip(row, nil)
+        guard let value, !self.connectivityCheckDisabled else {
+            card.valueField?.textColor = theme.value
+            card.valueField?.stringValue = "—"
+            self.setToolTip(card, nil)
             return
         }
         
-        // average of the last checks, as before
-        row.dot?.color = theme.green
-        if self.latency.isEmpty {
-            row.setPlain("—")
-        } else {
+        self.pingChart?.set(self.latency.map { [$0] })
+        guard value.status else {
+            card.valueField?.textColor = theme.red
+            card.valueField?.stringValue = isL("Offline", fr: "Hors ligne")
+            self.setToolTip(card, nil)
+            return
+        }
+        
+        card.valueField?.textColor = theme.value
+        card.valueField?.attributedStringValue = isValue(isNumber(value.latency, digits: value.latency < 10 ? 1 : 0), "ms")
+        
+        // average and jitter of the last checks
+        var parts: [String] = []
+        if !self.latency.isEmpty {
             let average = self.latency.reduce(0, +) / Double(self.latency.count)
-            row.set("\(isNumber(average, digits: average < 10 ? 1 : 0)) ms")
+            parts.append(self.pair(isL("Average", fr: "Moyenne"), "\(isNumber(average, digits: 1)) ms"))
         }
-        if self.jitter.isEmpty {
-            self.setToolTip(row, nil)
-        } else {
+        if !self.jitter.isEmpty {
             let average = self.jitter.reduce(0, +) / Double(self.jitter.count)
-            self.setToolTip(row, self.pair(isL("Jitter", fr: "Gigue"), "\(isNumber(average, digits: 1)) ms"))
+            parts.append(self.pair(isL("Jitter", fr: "Gigue"), "\(isNumber(average, digits: 1)) ms"))
         }
+        self.setToolTip(card, parts.isEmpty ? nil : parts.joined(separator: "\n"))
     }
     
     public func resetConnectivityView() {
         self.latency.removeAll()
         self.jitter.removeAll()
-        self.connectivityRow?.dot?.color = ISTheme.current.track
-        self.connectivityRow?.setPlain("—")
-        self.setToolTip(self.connectivityRow, nil)
+        self.pingChart?.set([])
+        self.pingCard?.valueField?.textColor = ISTheme.current.value
+        self.pingCard?.valueField?.stringValue = "—"
+        self.setToolTip(self.pingCard, nil)
     }
     
     public func processCallback(_ list: [Network_Process]) {
@@ -1013,5 +1204,63 @@ private final class NetAddressList {
         let title = netTextWidth(self.card.titleField?.stringValue ?? "", ISFont.label(13)) + 4
         let value = netTextWidth(text, ISFont.value(13)) + 4
         return title + 6 + value <= self.width
+    }
+}
+
+// MARK: - System state
+
+private struct NetVPNService {
+    let name: String
+    let connected: Bool
+    let since: Date?
+    let interface: String?
+}
+
+// what SystemConfiguration knows and the usage reader does not carry: the VPN services and the network location
+private enum NetSystem {
+    static func read() -> (vpn: [NetVPNService], location: String?) {
+        guard let prefs = SCPreferencesCreate(nil, "Stats" as CFString, nil) else { return ([], nil) }
+        
+        var location: String? = nil
+        if let set = SCNetworkSetCopyCurrent(prefs) {
+            location = SCNetworkSetGetName(set) as String?
+        }
+        
+        var list: [NetVPNService] = []
+        for service in (SCNetworkServiceCopyAll(prefs) as? [SCNetworkService]) ?? [] {
+            guard SCNetworkServiceGetEnabled(service),
+                  let interface = SCNetworkServiceGetInterface(service),
+                  let kind = SCNetworkInterfaceGetInterfaceType(interface) as String? else { continue }
+            
+            // "VPN" covers the apps built on Network Extension (Tailscale, WireGuard…); a PPP service is one only over L2TP or PPTP
+            var isVPN = kind == "VPN" || kind == "IPSec"
+            if kind == "PPP", let child = SCNetworkInterfaceGetInterface(interface),
+               let childKind = SCNetworkInterfaceGetInterfaceType(child) as String?, childKind == "L2TP" || childKind == "PPTP" {
+                isVPN = true
+            }
+            guard isVPN, let id = SCNetworkServiceGetServiceID(service),
+                  let connection = SCNetworkConnectionCreateWithServiceID(nil, id, nil, nil) else { continue }
+            
+            let connected = SCNetworkConnectionGetStatus(connection) == .connected
+            var since: Date? = nil
+            var device: String? = nil
+            if connected, let status = SCNetworkConnectionCopyExtendedStatus(connection) as? [String: Any] {
+                since = status["LastStatusChangeTime"] as? Date
+                if since == nil, let vpn = status["VPN"] as? [String: Any], let uptime = (vpn["ConnectTime"] as? NSNumber)?.doubleValue {
+                    // seconds of system uptime at the time of the connection
+                    since = Date().addingTimeInterval(-max(0, ProcessInfo.processInfo.systemUptime - uptime))
+                }
+                device = (status["IPv4"] as? [String: Any])?["InterfaceName"] as? String
+            }
+            
+            list.append(NetVPNService(
+                name: (SCNetworkServiceGetName(service) as String?) ?? "VPN",
+                connected: connected,
+                since: since,
+                interface: device
+            ))
+        }
+        
+        return (list, location)
     }
 }
