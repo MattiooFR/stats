@@ -668,6 +668,15 @@ public final class ISHistoryCard: ISCard, ISDetailContent {
     }
 }
 
+// a card of a side panel whose rows are filled by the module: at opening, then every two seconds
+public final class ISLiveCard: ISCard, ISDetailContent {
+    public var update: ((ISLiveCard) -> Void)?
+    
+    public func refresh() {
+        self.update?(self)
+    }
+}
+
 // what a side panel shows: the range switch on top when it holds history, then cards
 public final class ISDetailStack: NSStackView, ISDetailContent {
     public init(width: CGFloat = 256, ranges: Bool = true) {

@@ -15,6 +15,8 @@ import Kit
 internal class Popup: PopupWrapper {
     // (read, write) per tick, summed over all the disks, drawn as a mirror chart
     private let activityHistory = ISHistory<(Double, Double)>(capacity: 160)
+    // bytes read and written per second, kept up to 30 days for the side panel
+    private let longHistory = ISHistoryStore.shared.series("disk.activity", dimensions: 2)
     
     // cards that depend on the list of mounted volumes, always at the top of the popup
     private var volumeSections: [NSView] = []
@@ -142,6 +144,11 @@ internal class Popup: PopupWrapper {
         card.add(peaks)
         self.peaks = peaks
         
+        card.detailID = "history"
+        card.detail = { [weak self] in
+            self?.historyDetail() ?? NSView()
+        }
+        
         return card
     }
     
@@ -200,7 +207,16 @@ internal class Popup: PopupWrapper {
                 self.removeArrangedSubview(view)
                 view.removeFromSuperview()
             }
-            self.diskCards = layout.disks.map { DiskCard($0) }
+            // the figures that were in the tooltip of a disk open next to the popup while the pointer is on its card
+            self.diskCards = layout.disks.map { d in
+                let card = DiskCard(d)
+                let uuid = d.uuid
+                card.detailID = "disk:\(uuid)"
+                card.detail = { [weak self] in
+                    self?.diskDetail(uuid) ?? NSView()
+                }
+                return card
+            }
             var sections: [NSView] = self.diskCards
             if layout.network.isEmpty {
                 self.networkRows = []
@@ -222,7 +238,7 @@ internal class Popup: PopupWrapper {
             rebuilt = true
         }
         
-        zip(self.diskCards, layout.disks).forEach { $0.update($1, toolTip: self.details($1)) }
+        zip(self.diskCards, layout.disks).forEach { $0.update($1) }
         zip(self.networkRows, layout.network).forEach { $0.update($1) }
         zip(self.removableRows, layout.removable).forEach { $0.update($1) }
         if let activity = self.activityCache.value {
@@ -234,44 +250,124 @@ internal class Popup: PopupWrapper {
         }
     }
     
-    private func details(_ d: drive) -> String {
-        let colon = isL(":", fr: " :")
+    // MARK: - Side panels
+    
+    // side panel of a disk card: its space, what it read and wrote, and the health of the SSD
+    private func diskDetail(_ uuid: String) -> NSView {
+        let theme = ISTheme.current
+        let stack = ISDetailStack(width: self.frame.width, ranges: false)
         let unknown = localizedString("Unknown")
-        var lines: [String] = [
-            d.mediaName,
-            localizedString("Free disk memory", diskSize(d.free), diskSize(d.size)),
-            "\(localizedString("File system"))\(colon) \(d.fileSystem.isEmpty ? unknown : d.fileSystem.uppercased())",
-            "\(localizedString("Connection type"))\(colon) \(d.connectionType.isEmpty ? unknown : d.connectionType)"
-        ]
+        let name = self.capacity?.array.first(where: { $0.uuid == uuid })?.mediaName ?? ""
         
-        if let activity = self.activityCache.value?.drives[d.uuid], activity.readBytes != 0 || activity.writeBytes != 0 {
-            lines.append("\(localizedString("Total read"))\(colon) \(diskSize(activity.readBytes))")
-            lines.append("\(localizedString("Total written"))\(colon) \(diskSize(activity.writeBytes))")
+        let space = ISLiveCard(title: name.isEmpty ? isL("Disk", fr: "Disque") : name)
+        let used = ISRow(isL("Used", fr: "Utilisé"), color: theme.blue)
+        let free = ISRow(isL("Available", fr: "Disponible"), color: theme.track)
+        let size = ISRow(isL("Capacity", fr: "Capacité"))
+        let fileSystem = ISRow(localizedString("File system"))
+        let connection = ISRow(localizedString("Connection type"))
+        [used, free, size, fileSystem, connection].forEach { space.add($0) }
+        space.update = { [weak self] _ in
+            guard let d = self?.capacity?.array.first(where: { $0.uuid == uuid }) else { return }
+            used.set(diskSize(max(0, d.size - d.free)))
+            free.set(diskSize(d.free))
+            size.set(diskSize(d.size))
+            fileSystem.setPlain(d.fileSystem.isEmpty ? unknown : d.fileSystem.uppercased())
+            connection.setPlain(d.connectionType.isEmpty ? unknown : d.connectionType)
         }
+        stack.add(space)
         
-        if let smart = self.smartValues[d.uuid] {
-            lines.append("")
-            lines.append("SMART")
-            lines.append("\(localizedString("Temperature"))\(colon) \(temperature(Double(smart.temperature)))")
-            lines.append("\(localizedString("Health"))\(colon) \(smart.life)%")
-            lines.append("\(localizedString("Total read"))\(colon) \(diskSize(smart.totalRead))")
-            lines.append("\(localizedString("Total written"))\(colon) \(diskSize(smart.totalWritten))")
-            lines.append("\(localizedString("Power cycles"))\(colon) \(smart.powerCycles)")
-            lines.append("\(localizedString("Power on hours"))\(colon) \(smart.powerOnHours)")
-            if let warning = smart.criticalWarning {
-                let list = smartCriticalWarnings(warning)
-                lines.append("\(localizedString("Critical warning"))\(colon) \(list.isEmpty ? localizedString("None") : list.joined(separator: ", "))")
-            }
-            if let spare = smart.availableSpare {
-                var line = "\(localizedString("Available spare"))\(colon) \(spare)%"
-                if let threshold = smart.spareThreshold {
-                    line += " (\(localizedString("Threshold"))\(colon) \(threshold)%)"
-                }
-                lines.append(line)
+        let counters = ISLiveCard(title: isL("Since startup", fr: "Depuis le démarrage"))
+        let read = ISRow(isL("Data read", fr: "Données lues"), color: theme.pink)
+        let written = ISRow(isL("Data written", fr: "Données écrites"), color: theme.blue)
+        counters.add(read)
+        counters.add(written)
+        counters.update = { [weak self] card in
+            let activity = self?.activityCache.value?.drives[uuid]
+            let known = (activity?.readBytes ?? 0) != 0 || (activity?.writeBytes ?? 0) != 0
+            read.set(diskSize(activity?.readBytes ?? 0))
+            written.set(diskSize(activity?.writeBytes ?? 0))
+            if card.isHidden == known {
+                card.isHidden = !known
             }
         }
+        stack.add(counters)
         
-        return lines.joined(separator: "\n")
+        let health = ISLiveCard(title: isL("SSD health", fr: "Santé du SSD"), value: "")
+        let heat = ISRow(localizedString("Temperature"))
+        let totalRead = ISRow(localizedString("Total read"))
+        let totalWritten = ISRow(localizedString("Total written"))
+        let cycles = ISRow(localizedString("Power cycles"))
+        let hours = ISRow(localizedString("Power on hours"))
+        let warning = ISRow(localizedString("Critical warning"))
+        let spare = ISRow(localizedString("Available spare"))
+        [heat, totalRead, totalWritten, cycles, hours, warning, spare].forEach { health.add($0) }
+        health.update = { [weak self] card in
+            guard let smart = self?.smartValues[uuid] else {
+                if !card.isHidden { card.isHidden = true }
+                return
+            }
+            if card.isHidden { card.isHidden = false }
+            card.valueField?.attributedStringValue = isValue("\(smart.life)", "%", space: false)
+            heat.set(temperature(Double(smart.temperature)))
+            totalRead.set(diskSize(smart.totalRead))
+            totalWritten.set(diskSize(smart.totalWritten))
+            cycles.setPlain(NumberFormatter.localizedString(from: NSNumber(value: smart.powerCycles), number: .decimal))
+            hours.setPlain(NumberFormatter.localizedString(from: NSNumber(value: smart.powerOnHours), number: .decimal))
+            if let value = smart.criticalWarning {
+                let list = smartCriticalWarnings(value)
+                warning.setPlain(list.isEmpty ? localizedString("None") : list.joined(separator: ", "))
+            }
+            warning.isHidden = smart.criticalWarning == nil
+            if let value = smart.availableSpare {
+                spare.set("\(value)%")
+            }
+            spare.isHidden = smart.availableSpare == nil
+        }
+        stack.add(health)
+        
+        stack.refresh()
+        return stack
+    }
+    
+    // side panel of the activity card: reads and writes over time, their peaks and the amount of data of the period
+    private func historyDetail() -> NSView {
+        let theme = ISTheme.current
+        let stack = ISDetailStack()
+        
+        let activity = ISHistoryCard(
+            title: isL("Disk activity", fr: "Activité disque"),
+            series: self.longHistory,
+            style: .mirror,
+            colors: [theme.pink, theme.blue],
+            dims: [0, 1],
+            height: 84
+        )
+        let readPeak = ISRow(isL("Read, peak", fr: "Lecture, pic"), color: theme.pink)
+        let writePeak = ISRow(isL("Write, peak", fr: "Écriture, pic"), color: theme.blue)
+        activity.add(readPeak)
+        activity.add(writePeak)
+        
+        let data = ISCard(title: isL("Data", fr: "Données"), value: "")
+        let read = ISRow(isL("Read", fr: "Lues"), color: theme.pink)
+        let written = ISRow(isL("Written", fr: "Écrites"), color: theme.blue)
+        data.add(read)
+        data.add(written)
+        
+        activity.summary = { [weak self] _, points in
+            guard let self else { return }
+            let readSpeed = self.speed(points.isMaximum(0) ?? 0)
+            let writeSpeed = self.speed(points.isMaximum(1) ?? 0)
+            readPeak.set(readSpeed.0, unit: readSpeed.1)
+            writePeak.set(writeSpeed.0, unit: writeSpeed.1)
+            read.set(points.isTotal(0).map({ diskSize(Int64(min(max($0, 0), 9e18))) }) ?? "—")
+            written.set(points.isTotal(1).map({ diskSize(Int64(min(max($0, 0), 9e18))) }) ?? "—")
+            data.valueField?.stringValue = ISRange.current.title
+        }
+        stack.add(activity)
+        stack.add(data)
+        
+        stack.refresh()
+        return stack
     }
     
     // lists the network volumes without waiting for them, then asks each one for fresh numbers in the background
@@ -319,6 +415,7 @@ internal class Popup: PopupWrapper {
             activity.write += Double(d.activity.write)
         }
         
+        self.longHistory.record([activity.read, activity.write])
         DispatchQueue.main.async {
             self.activityHistory.append((activity.read, activity.write))
         }
@@ -359,7 +456,7 @@ internal class Popup: PopupWrapper {
                 self.smartValues[d.uuid] = smart
             }
         }
-        // SMART values are shown in the tooltip of the disk cards
+        // SMART values are shown in the side panel of the disk cards, which reads them when it refreshes
         self.renderVolumes()
     }
     
@@ -692,13 +789,12 @@ private final class DiskCard: ISCard {
         fatalError("init(coder:) has not been implemented")
     }
     
-    func update(_ d: drive, toolTip: String) {
+    func update(_ d: drive) {
         self.path = d.path
         self.nameField.stringValue = d.mediaName
         self.ring.set(value: d.percentage)
         self.percentField.stringValue = "\(Int((d.percentage * 100).rounded()))"
         self.freeField.stringValue = "\(diskSize(d.free)) \(isL("available", fr: "disponibles"))"
-        self.toolTip = toolTip
     }
     
     // bright when the disk was read / written during the last sample

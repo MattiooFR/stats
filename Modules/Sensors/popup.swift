@@ -58,6 +58,8 @@ internal class Popup: PopupWrapper {
     private var fansRing: ISRing? = nil
     private var cpuKey: String? = nil
     private var gpuKey: String? = nil
+    // [CPU temperature, GPU temperature, fans 0...1], kept up to 30 days for the side panel of the rings
+    private let overviewHistory = ISHistoryStore.shared.series("sensors.overview", dimensions: 3)
     
     private var unknownSensorsState: Bool { Store.shared.bool(key: "Sensors_unknown", defaultValue: false) }
     
@@ -210,11 +212,9 @@ internal class Popup: PopupWrapper {
         let temperatures = sensors.filter { $0.type == .temperature }
         let keys = Set(temperatures.map { $0.key })
         
-        self.cpuKey = ["Average CPU", "Hottest CPU", "TC0D", "TC0E", "TC0F", "TC0P", "TC0H", "TCAD"].first(where: { keys.contains($0) })
-            ?? temperatures.first(where: { $0.group == .CPU })?.key
-            ?? ["Average SOC", "Hottest SOC"].first(where: { keys.contains($0) })
-        self.gpuKey = ["Average GPU", "Hottest GPU", "TGDD", "TG0D", "TCGC", "TG0P", "TG0H"].first(where: { keys.contains($0) })
-            ?? temperatures.first(where: { $0.key.hasPrefix("GPU MTR Temp") })?.key
+        let picked = self.pickKeys(sensors)
+        self.cpuKey = picked.cpu
+        self.gpuKey = picked.gpu
         let hasFans = sensors.contains(where: { $0 is Fan && !$0.isComputed })
         
         let count = (self.cpuKey == nil ? 0 : 1) + (self.gpuKey == nil ? 0 : 1) + (hasFans ? 1 : 0)
@@ -248,7 +248,100 @@ internal class Popup: PopupWrapper {
             self.fansRing = ring
         }
         
+        card.detailID = "history"
+        card.detail = { [weak self] in
+            self?.historyDetail(fans: hasFans) ?? NSView()
+        }
+        
         return card
+    }
+    
+    // the sensors behind the CPU and GPU rings
+    private func pickKeys(_ sensors: [Sensor_p]) -> (cpu: String?, gpu: String?) {
+        let temperatures = sensors.filter { $0.type == .temperature }
+        let keys = Set(temperatures.map { $0.key })
+        
+        let cpu = ["Average CPU", "Hottest CPU", "TC0D", "TC0E", "TC0F", "TC0P", "TC0H", "TCAD"].first(where: { keys.contains($0) })
+            ?? temperatures.first(where: { $0.group == .CPU })?.key
+            ?? ["Average SOC", "Hottest SOC"].first(where: { keys.contains($0) })
+        let gpu = ["Average GPU", "Hottest GPU", "TGDD", "TG0D", "TCGC", "TG0P", "TG0H"].first(where: { keys.contains($0) })
+            ?? temperatures.first(where: { $0.key.hasPrefix("GPU MTR Temp") })?.key
+        return (cpu, gpu)
+    }
+    
+    // side panel of the rings: the two temperatures and the fans over time
+    private func historyDetail(fans: Bool) -> NSView {
+        let theme = ISTheme.current
+        let stack = ISDetailStack()
+        let hasCPU = self.cpuKey != nil
+        let hasGPU = self.gpuKey != nil
+        
+        if hasCPU || hasGPU {
+            let heat = ISHistoryCard(
+                title: localizedString("Temperature"),
+                series: self.overviewHistory,
+                style: .lines,
+                colors: [theme.blue, theme.pink],
+                dims: [0, 1],
+                height: 64,
+                scale: 110
+            )
+            let cpu = ISRow("CPU", color: theme.blue)
+            let cpuPeak = ISRow(isL("CPU, peak", fr: "CPU, pic"))
+            let gpu = ISRow("GPU", color: theme.pink)
+            let gpuPeak = ISRow(isL("GPU, peak", fr: "GPU, pic"))
+            [cpu, cpuPeak, gpu, gpuPeak].forEach { heat.add($0) }
+            cpu.isHidden = !hasCPU
+            cpuPeak.isHidden = !hasCPU
+            gpu.isHidden = !hasGPU
+            gpuPeak.isHidden = !hasGPU
+            heat.summary = { _, points in
+                cpu.set(points.isAverage(0).map({ temperature($0) }) ?? "—")
+                cpuPeak.set(points.isMaximum(0).map({ temperature($0) }) ?? "—")
+                gpu.set(points.isAverage(1).map({ temperature($0) }) ?? "—")
+                gpuPeak.set(points.isMaximum(1).map({ temperature($0) }) ?? "—")
+            }
+            stack.add(heat)
+        }
+        
+        if fans {
+            let speed = ISHistoryCard(
+                title: localizedString("Fans"),
+                series: self.overviewHistory,
+                style: .stacked,
+                colors: [theme.yellow],
+                dims: [2],
+                height: 40,
+                scale: 1
+            )
+            let average = ISRow(isL("Average", fr: "Moyenne"))
+            let peak = ISRow(isL("Peak", fr: "Pic"))
+            speed.add(average)
+            speed.add(peak)
+            speed.summary = { _, points in
+                average.set(points.isAverage(2).map({ isPercent($0) }) ?? "—")
+                peak.set(points.isMaximum(2).map({ isPercent(min($0, 1)) }) ?? "—")
+            }
+            stack.add(speed)
+        }
+        
+        stack.refresh()
+        return stack
+    }
+    
+    // called at every reading, popup open or not
+    private func recordOverview(_ values: [Sensor_p]) {
+        if self.cpuKey == nil && self.gpuKey == nil {
+            let picked = self.pickKeys(values)
+            self.cpuKey = picked.cpu
+            self.gpuKey = picked.gpu
+        }
+        let cpu = self.cpuKey.flatMap({ key in values.first(where: { $0.key == key })?.value }) ?? 0
+        let gpu = self.gpuKey.flatMap({ key in values.first(where: { $0.key == key })?.value }) ?? 0
+        let fans = values.compactMap({ $0 as? Fan }).filter({ !$0.isComputed })
+        let usage = fans.isEmpty ? 0 : fans.map({ fanUsage($0) }).reduce(0, +) / Double(fans.count)
+        guard self.cpuKey != nil || self.gpuKey != nil || !fans.isEmpty else { return }
+        self.overviewHistory.record([cpu, gpu, usage])
     }
     
     private func initCard(_ type: SensorType, all: [Sensor_p], visible: [Sensor_p]) -> NSView {
@@ -363,6 +456,7 @@ internal class Popup: PopupWrapper {
                 guard s is Sensor, s.value.isFinite else { return }
                 self.history(for: s.key).append(s.value)
             }
+            self.recordOverview(values)
             
             self.sensorsCache.value = values
             guard self.contentLoaded else { return }
