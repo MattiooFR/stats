@@ -276,6 +276,8 @@ internal class Popup: PopupWrapper {
     
     // lists the network volumes without waiting for them, then asks each one for fresh numbers in the background
     private func refreshRemoteVolumes() {
+        // nothing shows them while the popup and its settings are closed: no listing at every tick
+        guard self.contentLoaded || self.settingsLoaded else { return }
         self.remoteVolumes = DiskVolume.remote()
         guard self.contentLoaded, !self.remoteRefreshing, !self.remoteVolumes.isEmpty else { return }
         
@@ -404,6 +406,7 @@ internal class Popup: PopupWrapper {
     
     public override func settings() -> NSView? {
         self.settingsLoaded = true
+        self.remoteVolumes = DiskVolume.remote()
         if self.capacity != nil { self.updateSettings() }
         let view = SettingsContainerView()
         

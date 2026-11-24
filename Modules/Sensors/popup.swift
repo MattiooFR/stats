@@ -1542,8 +1542,8 @@ private class ModeSwitch: NSStackView {
         self.autoBtn.state = .off
         self.manualBtn.state = .on
         
-        self.autoBtn.layer?.backgroundColor = self.selectedColor
-        self.manualBtn.layer?.backgroundColor = NSColor.clear.cgColor
+        self.autoBtn.layer?.backgroundColor = NSColor.clear.cgColor
+        self.manualBtn.layer?.backgroundColor = self.selectedColor
         
         self.manualCallback?()
     }

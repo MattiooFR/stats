@@ -33,6 +33,7 @@ internal class Popup: PopupWrapper {
     private var gpuCard: ISCard? = nil
     private var gpuRings: ISRingRow? = nil
     private var gpuProcesses: ISProcessList? = nil
+    private var appearedAt: Date = .distantPast
     private var averageCard: ISCard? = nil
     private var frequencyCard: ISCard? = nil
     private var uptimeCard: ISCard? = nil
@@ -119,6 +120,7 @@ internal class Popup: PopupWrapper {
     public override func appear() {
         // the GPU module keeps its process list running while this popup shows the GPU card
         ISGPUShare.shared.watch(self.title, true)
+        self.appearedAt = Date()
         self.renderGPU()
         self.renderGPUProcesses()
         self.uptimeCard?.valueField?.stringValue = self.uptimeValue
@@ -313,6 +315,11 @@ internal class Popup: PopupWrapper {
     }
 
     private func renderLoad(_ value: CPU_Load) {
+        // the GPU module was turned off while this popup is open: its card goes away instead of freezing
+        if let card = self.gpuCard, !card.isHidden, !ISGPUShare.shared.live {
+            card.isHidden = true
+            self.resizeToFitContent()
+        }
         self.legend?.set(0, isPercent(value.userLoad))
         self.legend?.set(1, isPercent(value.systemLoad))
         self.chart?.set(self.loadHistory.values)
@@ -333,6 +340,12 @@ internal class Popup: PopupWrapper {
 
     @objc private func gpuUpdated() {
         guard self.contentLoaded else { return }
+        // safety net: the content was prepared but the window never came on screen (a toggle received while
+        // it was closing). Without this the GPU module would keep its process list running for nobody.
+        if self.window?.isVisible != true && Date().timeIntervalSince(self.appearedAt) > 2 {
+            ISGPUShare.shared.watch(self.title, false)
+            return
+        }
         self.renderGPU()
     }
     

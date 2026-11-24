@@ -102,6 +102,7 @@ public final class ISGPUShare {
     private let lock = NSLock()
     private var _snapshot: ISGPUSnapshot?
     private var _processes: [TopProcess] = []
+    private var processesDate: Date = .distantPast
     private var watchers: Set<String> = []
 
     private init() {}
@@ -112,10 +113,12 @@ public final class ISGPUShare {
         return self._snapshot
     }
 
+    // the GPU process reader only runs while a popup shows the GPU: a list left from an earlier opening
+    // (it can be hours old) is not handed out as if it were current
     public var processes: [TopProcess] {
         self.lock.lock()
         defer { self.lock.unlock() }
-        return self._processes
+        return Date().timeIntervalSince(self.processesDate) < 30 ? self._processes : []
     }
 
     // a popup other than the GPU one is showing the GPU right now
@@ -143,6 +146,7 @@ public final class ISGPUShare {
     public func publish(processes: [TopProcess]) {
         self.lock.lock()
         self._processes = processes
+        self.processesDate = Date()
         self.lock.unlock()
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: ISGPUShare.processesUpdated, object: nil)

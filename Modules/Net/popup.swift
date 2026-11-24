@@ -832,15 +832,18 @@ internal class Popup: PopupWrapper {
             self.pingHistory.record(value.status ? [value.latency, 0, 1] : [0, 1, 0])
         }
         DispatchQueue.main.async {
+            // a check without an answer has no latency: left out, the bars and the average only show real answers
+            // (the side panel counts the losses on its own)
+            guard let value, value.status else { return }
             if self.latency.count >= 90 {
                 self.latency.removeFirst()
             }
-            self.latency.append(value?.latency ?? 0)
+            self.latency.append(value.latency)
             
             if self.jitter.count >= 90 {
                 self.jitter.removeFirst()
             }
-            self.jitter.append(value?.jitter ?? 0)
+            self.jitter.append(value.jitter)
         }
         self.apply(value, to: self.connectivityCache, render: self.renderConnectivity)
     }

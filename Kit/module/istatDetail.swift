@@ -94,8 +94,22 @@ public final class ISSeries {
     private var last: TimeInterval?
     private var seeded: Bool = false
     private let lock = NSLock()
-    fileprivate var dirty: Bool = false
+    // bumped by every sample; the one written to disk last is remembered, so a write that failed is tried again
+    private var generation: UInt64 = 0
+    private var savedGeneration: UInt64 = 0
     fileprivate var seeding: Bool = false
+    
+    fileprivate var dirty: Bool {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return self.generation != self.savedGeneration
+    }
+    
+    fileprivate func markSaved(_ generation: UInt64) {
+        self.lock.lock()
+        self.savedGeneration = generation
+        self.lock.unlock()
+    }
 
     fileprivate init(key: String, dimensions: Int, kind: Kind) {
         self.key = key
@@ -108,6 +122,8 @@ public final class ISSeries {
     public func record(_ values: [Double], at date: Date = Date()) {
         guard values.count == self.dimensions, !values.contains(where: { !$0.isFinite }) else { return }
         let now = date.timeIntervalSince1970
+        // a clock before 1970 would give negative slot numbers
+        guard now > 0 else { return }
 
         self.lock.lock()
         defer { self.lock.unlock() }
@@ -143,7 +159,7 @@ public final class ISSeries {
                 self.tiers[t][position].peaks[i] = max(self.tiers[t][position].peaks[i], rates[i])
             }
         }
-        self.dirty = true
+        self.generation &+= 1
     }
 
     // oldest first, always ISRange.slots items; nil where nothing was recorded (Mac asleep, app closed)
@@ -157,8 +173,12 @@ public final class ISSeries {
         var result: [ISPoint?] = []
         result.reserveCapacity(ISRange.slots)
         for index in (current - Int64(ISRange.slots) + 1)...current {
+            guard index >= 0 else {
+                result.append(nil)
+                continue
+            }
             let slot = self.tiers[t][Int(index % Int64(ISRange.slots))]
-            guard index >= 0, slot.index == index, slot.seconds > 0 else {
+            guard slot.index == index, slot.seconds > 0 else {
                 result.append(nil)
                 continue
             }
@@ -199,7 +219,7 @@ public final class ISSeries {
         }
     }
 
-    fileprivate func encoded() -> [String: Any] {
+    fileprivate func encoded() -> (object: [String: Any], generation: UInt64) {
         self.lock.lock()
         defer { self.lock.unlock() }
 
@@ -211,8 +231,7 @@ public final class ISSeries {
             }
             tiers[range.rawValue] = rows
         }
-        self.dirty = false
-        return ["version": 1, "dimensions": self.dimensions, "tiers": tiers]
+        return (["version": 1, "dimensions": self.dimensions, "tiers": tiers], self.generation)
     }
 
     fileprivate func decode(_ object: Any) {
@@ -330,9 +349,13 @@ public final class ISHistoryStore {
         self.lock.unlock()
 
         for series in pending {
+            let snapshot = series.encoded()
             guard let url = self.url(series.key),
-                  let data = try? JSONSerialization.data(withJSONObject: series.encoded()) else { continue }
-            try? data.write(to: url, options: .atomic)
+                  let data = try? JSONSerialization.data(withJSONObject: snapshot.object) else { continue }
+            // only what reached the disk counts as saved
+            if (try? data.write(to: url, options: .atomic)) != nil {
+                series.markSaved(snapshot.generation)
+            }
         }
     }
 }
