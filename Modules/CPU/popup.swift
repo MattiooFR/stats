@@ -29,6 +29,10 @@ internal class Popup: PopupWrapper {
     private var sCoresRow: ISRow? = nil
 
     private var processes: ISProcessList? = nil
+    // the GPU inside the CPU menu, as in iStat Menus: readings shared by the GPU module
+    private var gpuCard: ISCard? = nil
+    private var gpuRings: ISRingRow? = nil
+    private var gpuProcesses: ISProcessList? = nil
     private var averageCard: ISCard? = nil
     private var frequencyCard: ISCard? = nil
     private var uptimeCard: ISCard? = nil
@@ -67,6 +71,13 @@ internal class Popup: PopupWrapper {
 
         self.spacing = ISMetrics.spacing
         self.orientation = .vertical
+        
+        NotificationCenter.default.addObserver(self, selector: #selector(self.gpuUpdated), name: ISGPUShare.updated, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(self.gpuProcessesUpdated), name: ISGPUShare.processesUpdated, object: nil)
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     required init?(coder: NSCoder) {
@@ -79,6 +90,7 @@ internal class Popup: PopupWrapper {
         if self.numberOfProcesses > 0 {
             self.addSection(self.initProcesses())
         }
+        self.addSection(self.initGPU())
         self.addSection(self.initAverage())
         self.addSection(self.initFrequency())
         self.addSection(self.initUptime())
@@ -96,12 +108,19 @@ internal class Popup: PopupWrapper {
         self.pCoresRow = nil
         self.sCoresRow = nil
         self.processes = nil
+        self.gpuCard = nil
+        self.gpuRings = nil
+        self.gpuProcesses = nil
         self.averageCard = nil
         self.frequencyCard = nil
         self.uptimeCard = nil
     }
 
     public override func appear() {
+        // the GPU module keeps its process list running while this popup shows the GPU card
+        ISGPUShare.shared.watch(self.title, true)
+        self.renderGPU()
+        self.renderGPUProcesses()
         self.uptimeCard?.valueField?.stringValue = self.uptimeValue
         self.replay(self.loadCache, render: self.renderLoad)
         self.replay(self.temperatureCache, render: self.renderTemperature)
@@ -110,6 +129,10 @@ internal class Popup: PopupWrapper {
         self.replay(self.processCache, render: self.renderProcesses)
     }
 
+    public override func disappear() {
+        ISGPUShare.shared.watch(self.title, false)
+    }
+    
     // MARK: - Views
 
     private func initUsage() -> NSView {
@@ -168,6 +191,28 @@ internal class Popup: PopupWrapper {
         return card
     }
 
+    // hidden until the GPU module publishes something (it can be turned off)
+    private func initGPU() -> NSView {
+        let card = ISCard(title: "GPU", value: "")
+        
+        let row = ISRingRow(count: 4, diameter: 52, lineWidth: 4.5)
+        card.add(row, spacingAfter: 3)
+        self.gpuRings = row
+        
+        let list = ISProcessList(n: 3)
+        list.isHidden = true
+        card.add(list)
+        self.gpuProcesses = list
+        
+        card.detailID = "gpu"
+        card.detail = {
+            ISGPUShare.shared.historyDetail()
+        }
+        card.isHidden = !ISGPUShare.shared.live
+        self.gpuCard = card
+        return card
+    }
+    
     private func initAverage() -> NSView {
         let card = ISCard(title: localizedString("Average load"), value: "—")
         self.attachHistory(card)
@@ -286,6 +331,56 @@ internal class Popup: PopupWrapper {
         self.coreRings?.set(usagePerCore)
     }
 
+    @objc private func gpuUpdated() {
+        guard self.contentLoaded else { return }
+        self.renderGPU()
+    }
+    
+    @objc private func gpuProcessesUpdated() {
+        guard self.contentLoaded else { return }
+        self.renderGPUProcesses()
+    }
+    
+    private func renderGPU() {
+        guard let card = self.gpuCard, let snapshot = ISGPUShare.shared.snapshot, ISGPUShare.shared.live else { return }
+        card.valueField?.stringValue = snapshot.fps.map { "\(Int($0.rounded())) FPS" } ?? ""
+        
+        let gauges = Array(snapshot.gauges.prefix(4))
+        for (i, ring) in (self.gpuRings?.rings ?? []).enumerated() {
+            let hidden = i >= gauges.count
+            if ring.isHidden != hidden {
+                ring.isHidden = hidden
+            }
+            guard !hidden else { continue }
+            ring.set(value: gauges[i].arc)
+            ring.setText(gauges[i].number, unit: gauges[i].unit, caption: gauges[i].caption)
+            if ring.toolTip != gauges[i].toolTip {
+                ring.toolTip = gauges[i].toolTip
+            }
+        }
+        
+        if card.isHidden {
+            card.isHidden = false
+            self.resizeToFitContent()
+        }
+    }
+    
+    private func renderGPUProcesses() {
+        guard let list = self.gpuProcesses else { return }
+        let processes = ISGPUShare.shared.processes
+        let n = min(processes.count, list.count)
+        for i in 0..<n {
+            let usage = processes[i].usage
+            list.set(i, processes[i], [usage < 0.05 ? "0%" : "\(isNumber(usage))%"])
+        }
+        list.clear(from: n)
+        
+        if list.isHidden != (n == 0) {
+            list.isHidden = n == 0
+            self.resizeToFitContent()
+        }
+    }
+    
     public func temperatureCallback(_ value: Double?) {
         self.apply(value, to: self.temperatureCache, render: self.renderTemperature)
     }

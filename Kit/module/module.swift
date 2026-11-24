@@ -110,6 +110,8 @@ open class Module {
     private var readers: [Reader_p] = []
     private var popupVisible = false
     private var settingsVisible = false
+    // another popup shows the readings of this module (the GPU card of the CPU menu)
+    private var externalVisible = false
     
     public var summaryCallback: ((ModuleType, Double?) -> Void)? = nil
     
@@ -158,6 +160,7 @@ open class Module {
         NotificationCenter.default.addObserver(self, selector: #selector(self.listenForPopupToggle), name: .togglePopup, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(self.listenForToggleWidget), name: .toggleWidget, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(self.listenForWindowOpen), name: .openWindow, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(self.listenForExternalConsumer), name: .externalPopupConsumer, object: nil)
         
         // swiftlint:disable empty_count
         if self.config.widgetsConfig.count != 0 {
@@ -295,11 +298,18 @@ open class Module {
         self.updateReaderVisibility()
     }
     
+    @objc private func listenForExternalConsumer(_ notification: Notification) {
+        guard let name = notification.userInfo?["module"] as? String, name == self.config.name,
+              let state = notification.userInfo?["state"] as? Bool, self.externalVisible != state else { return }
+        self.externalVisible = state
+        self.updateReaderVisibility()
+    }
+    
     private func readerHasVisibleConsumer(_ reader: Reader_p) -> Bool {
         // Regular readers can enter sleep mode while either view is already open.
         let shared = reader.sleep || (!reader.popup && !reader.preview)
         return self.enabled && (
-            (self.popupVisible && (reader.popup || shared)) ||
+            ((self.popupVisible || self.externalVisible) && (reader.popup || shared)) ||
             (self.settingsVisible && (reader.preview || shared))
         )
     }

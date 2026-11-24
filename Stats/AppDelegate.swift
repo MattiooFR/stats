@@ -90,8 +90,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 8) { module.debugHover(1, enter: false) }
             }
+            // STATS_DEBUG_ONLY=<module>: only that popup is opened (what it shows of the other modules must still work)
+            let only = ProcessInfo.processInfo.environment["STATS_DEBUG_ONLY"] ?? ""
             var x: CGFloat = hover.isEmpty ? 20 : 420
-            for module in modules {
+            for module in modules where only.isEmpty || module.name == only {
                 if let id = module.debugShowPopup(at: NSPoint(x: x, y: 100)) {
                     lines.append("\(module.name) \(id)")
                     x += 40
@@ -99,7 +101,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             }
             // the side panels (history, details) of every popup, opened on their own
             var dx: CGFloat = 20
-            for module in modules where ProcessInfo.processInfo.environment["STATS_DEBUG_NODETAILS"] == nil {
+            for module in modules where ProcessInfo.processInfo.environment["STATS_DEBUG_NODETAILS"] == nil && (only.isEmpty || module.name == only) {
                 for (id, number) in module.debugShowDetails(from: NSPoint(x: dx, y: 100)) {
                     lines.append("detail-\(module.name)-\(id) \(number)")
                     dx += 40

@@ -130,6 +130,7 @@
 		9A28477B2666AA5000EC1F6D /* popup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A2847762666AA5000EC1F6D /* popup.swift */; };
 		1A57A70000000000000000A2 /* istat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A57A70000000000000000A1 /* istat.swift */; };
 		1A57A70000000000000000A4 /* istatDetail.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A57A70000000000000000A3 /* istatDetail.swift */; };
+		1A57A70000000000000000A6 /* istatGPU.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A57A70000000000000000A5 /* istatGPU.swift */; };
 		9A28477C2666AA5000EC1F6D /* reader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A2847772666AA5000EC1F6D /* reader.swift */; };
 		9A28477D2666AA5000EC1F6D /* widget.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A2847782666AA5000EC1F6D /* widget.swift */; };
 		9A2847C22666AA8700EC1F6D /* Kit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9A2846F72666A9CC00EC1F6D /* Kit.framework */; };
@@ -679,6 +680,7 @@
 		9A2847762666AA5000EC1F6D /* popup.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = popup.swift; sourceTree = "<group>"; };
 		1A57A70000000000000000A1 /* istat.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = istat.swift; sourceTree = "<group>"; };
 		1A57A70000000000000000A3 /* istatDetail.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = istatDetail.swift; sourceTree = "<group>"; };
+		1A57A70000000000000000A5 /* istatGPU.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = istatGPU.swift; sourceTree = "<group>"; };
 		9A2847772666AA5000EC1F6D /* reader.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = reader.swift; sourceTree = "<group>"; };
 		9A2847782666AA5000EC1F6D /* widget.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = widget.swift; sourceTree = "<group>"; };
 		9A2848012666AB2F00EC1F6D /* updater.sh */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.sh; path = updater.sh; sourceTree = "<group>"; };
@@ -1161,6 +1163,7 @@
 				9A2847762666AA5000EC1F6D /* popup.swift */,
 				1A57A70000000000000000A1 /* istat.swift */,
 				1A57A70000000000000000A3 /* istatDetail.swift */,
+				1A57A70000000000000000A5 /* istatGPU.swift */,
 				9A2847782666AA5000EC1F6D /* widget.swift */,
 				9A2847772666AA5000EC1F6D /* reader.swift */,
 				9A2847752666AA5000EC1F6D /* window.swift */,
@@ -2291,6 +2294,7 @@
 				9A28477B2666AA5000EC1F6D /* popup.swift in Sources */,
 				1A57A70000000000000000A2 /* istat.swift in Sources */,
 				1A57A70000000000000000A4 /* istatDetail.swift in Sources */,
+				1A57A70000000000000000A6 /* istatGPU.swift in Sources */,
 				5C038CF62D86EE8A00516809 /* SystemStats.swift in Sources */,
 				9A2848202666AB3600EC1F6D /* types.swift in Sources */,
 				9A28481E2666AB3600EC1F6D /* extensions.swift in Sources */,

@@ -9,6 +9,7 @@
 # e.g. "Disk_state=true;Sensors_state=true;CPU_processes=5;CPU_widget=bar_chart".
 # The side panels (history shown on hover) are captured too, as detail-<Module>-<id>.png. The run reads the
 # history kept by the installed app and never writes it; STATS_DEBUG_HISTORY=seed draws a made up curve instead.
+# STATS_DEBUG_ONLY=CPU opens that popup alone (to check what it shows of another module, like its GPU card).
 # Build first:
 #   xcodebuild -project Stats.xcodeproj -scheme Stats -configuration Debug -derivedDataPath build/dd \
 #     -destination 'platform=macOS,arch=arm64' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
@@ -18,7 +19,7 @@ OVERRIDES=${2:-}
 APP="$ROOT/build/dd/Build/Products/Debug/Stats.app/Contents/MacOS/Stats"
 OUT="$ROOT/build/shots/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
-STATS_DEBUG_HISTORY="${STATS_DEBUG_HISTORY:-}" STATS_DEBUG_OVERRIDES="$OVERRIDES" STATS_DEBUG_POPUPS="$OUT/ids.txt" "$APP" > "$OUT/run.log" 2>&1 &
+STATS_DEBUG_ONLY="${STATS_DEBUG_ONLY:-}" STATS_DEBUG_HISTORY="${STATS_DEBUG_HISTORY:-}" STATS_DEBUG_OVERRIDES="$OVERRIDES" STATS_DEBUG_POPUPS="$OUT/ids.txt" "$APP" > "$OUT/run.log" 2>&1 &
 PID=$!
 for i in {1..15}; do
   /bin/sleep 1

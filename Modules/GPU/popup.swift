@@ -59,10 +59,9 @@ internal class Popup: PopupWrapper {
     // Stats has no GPU temperature in the module readings: it is read from the SMC while the popup is open
     private let temperatureReader = GPUTemperatureReader()
     private var temperatureValue: Double? = nil
-    // [utilization, renderer, tiler, memory in bytes, frames per second] and the temperature, kept up to 30 days for the side panel
-    private let longHistory = ISHistoryStore.shared.series("gpu.usage", dimensions: 5)
-    private let temperatureHistory = ISHistoryStore.shared.series("gpu.temperature", dimensions: 1)
+    // reader thread only: when the SMC was last read, and what it said
     private var temperatureReadAt: TimeInterval = 0
+    private var temperatureRead: Double? = nil
     
     private var card: ISCard? = nil
     private var ringRow: ISRingRow? = nil
@@ -194,112 +193,12 @@ internal class Popup: PopupWrapper {
     
     // MARK: - History panel
     
-    // both cards share one side panel: utilization, renderer and tiler, memory and temperature over time
+    // both cards share one side panel (also opened from the GPU card of the CPU menu)
     private func attachHistory(_ card: ISCard) {
         card.detailID = "history"
-        card.detail = { [weak self] in
-            self?.historyDetail() ?? NSView()
+        card.detail = {
+            ISGPUShare.shared.historyDetail()
         }
-    }
-    
-    private func bytes(_ value: Double) -> String {
-        Units(bytes: Int64(max(0, value))).getReadableMemory(style: .memory)
-    }
-    
-    private func historyDetail() -> NSView {
-        let theme = ISTheme.current
-        let stack = ISDetailStack()
-        let current = self.loadCache.value
-        
-        let usage = ISHistoryCard(
-            title: isL("Utilization", fr: "Utilisation"),
-            series: self.longHistory,
-            style: .stacked,
-            colors: [theme.blue],
-            dims: [0],
-            height: 72,
-            scale: 1
-        )
-        let average = ISRow(isL("Average", fr: "Moyenne"))
-        let peak = ISRow(isL("Peak", fr: "Pic"))
-        let frames = ISRow(isL("Frames per second", fr: "Images par seconde"))
-        usage.add(average)
-        usage.add(peak)
-        usage.add(frames)
-        frames.isHidden = current?.fps == nil
-        usage.summary = { _, points in
-            average.set(points.isAverage(0).map({ isPercent($0) }) ?? "—")
-            peak.set(points.isMaximum(0).map({ isPercent(min($0, 1)) }) ?? "—")
-            frames.setPlain(points.isAverage(4).map({ "\(Int($0.rounded()))" }) ?? "—")
-        }
-        stack.add(usage)
-        
-        if current?.renderUtilization != nil || current?.tilerUtilization != nil {
-            let stages = ISHistoryCard(
-                title: isL("Renderer and tiler", fr: "Rendu et tiler"),
-                series: self.longHistory,
-                style: .lines,
-                colors: [theme.blue, theme.pink],
-                dims: [1, 2],
-                height: 44,
-                scale: 1
-            )
-            let render = ISRow(isL("Renderer", fr: "Rendu"), color: theme.blue)
-            let tiler = ISRow("Tiler", color: theme.pink)
-            stages.add(render)
-            stages.add(tiler)
-            stages.summary = { _, points in
-                render.set(points.isAverage(1).map({ isPercent($0) }) ?? "—")
-                tiler.set(points.isAverage(2).map({ isPercent($0) }) ?? "—")
-            }
-            stack.add(stages)
-        }
-        
-        if current?.memory != nil {
-            // scaled to the highest value on screen: against the whole unified memory the bars would stay flat
-            let memory = ISHistoryCard(
-                title: localizedString("Memory"),
-                series: self.longHistory,
-                style: .stacked,
-                colors: [theme.yellow],
-                dims: [3],
-                height: 40
-            )
-            let memoryAverage = ISRow(isL("Average", fr: "Moyenne"))
-            let memoryPeak = ISRow(isL("Peak", fr: "Pic"))
-            memory.add(memoryAverage)
-            memory.add(memoryPeak)
-            memory.summary = { [weak self] _, points in
-                guard let self else { return }
-                memoryAverage.set(points.isAverage(3).map({ self.bytes($0) }) ?? "—")
-                memoryPeak.set(points.isMaximum(3).map({ self.bytes($0) }) ?? "—")
-            }
-            stack.add(memory)
-        }
-        
-        if self.temperatureValue != nil {
-            let heat = ISHistoryCard(
-                title: localizedString("Temperature"),
-                series: self.temperatureHistory,
-                style: .lines,
-                colors: [theme.pink],
-                dims: [0],
-                height: 40,
-                scale: 110
-            )
-            let heatAverage = ISRow(isL("Average", fr: "Moyenne"))
-            let heatPeak = ISRow(isL("Peak", fr: "Pic"))
-            heat.add(heatAverage)
-            heat.add(heatPeak)
-            heat.summary = { _, points in
-                heatAverage.set(points.isAverage(0).map({ temperature($0) }) ?? "—")
-                heatPeak.set(points.isMaximum(0).map({ temperature($0) }) ?? "—")
-            }
-            stack.add(heat)
-        }
-        
-        stack.refresh()
-        return stack
     }
     
     // MARK: - Updates
@@ -334,18 +233,20 @@ internal class Popup: PopupWrapper {
     }
     
     public func loadCallback(_ value: GPU_Info) {
-        // the SMC is read at every tick while the popup is open, every 30 seconds otherwise (enough for the history)
+        // the SMC is read at every tick while a popup shows the GPU (this one or the CPU menu),
+        // every 30 seconds otherwise (enough for the history)
         let now = Date().timeIntervalSince1970
         var temperature: Double? = nil
-        if self.temperatureReader.isActive || now - self.temperatureReadAt >= 30 {
+        if self.temperatureReader.isActive || ISGPUShare.shared.watched || now - self.temperatureReadAt >= 30 {
             temperature = self.temperatureReader.read(ioClass: value.IOClass)
             self.temperatureReadAt = now
             if let temperature {
-                self.temperatureHistory.record([temperature])
+                self.temperatureRead = temperature
+                ISGPUShare.shared.temperatureHistory.record([temperature])
             }
         }
         if let utilization = value.utilization {
-            self.longHistory.record([
+            ISGPUShare.shared.usageHistory.record([
                 utilization,
                 value.renderUtilization ?? 0,
                 value.tilerUtilization ?? 0,
@@ -353,6 +254,17 @@ internal class Popup: PopupWrapper {
                 value.fps ?? 0
             ])
         }
+        // shared with the GPU card of the CPU menu
+        ISGPUShare.shared.publish(ISGPUSnapshot(
+            utilization: value.utilization,
+            memory: self.memoryUsage(value),
+            memoryBytes: value.memory,
+            temperature: self.temperatureRead,
+            ane: value.aneUtilization,
+            render: value.renderUtilization,
+            tiler: value.tilerUtilization,
+            fps: value.fps
+        ))
         DispatchQueue.main.async {
             if let utilization = value.utilization {
                 self.history(for: value.id).append([utilization])
@@ -463,6 +375,7 @@ internal class Popup: PopupWrapper {
     
     public func processCallback(_ list: [TopProcess]?) {
         guard let list else { return }
+        ISGPUShare.shared.publish(processes: list)
         self.apply(list, to: self.processesCache, render: self.renderProcesses)
     }
     
