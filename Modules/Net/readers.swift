@@ -279,7 +279,14 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
         self.wifiClient.delegate = nil
     }
     
+    // at start the first read and the first tick of the timer can run at the same time on two threads:
+    // one at a time, so they cannot interleave on the counters kept between two reads
+    private let readLock = NSLock()
+    
     public override func read() {
+        self.readLock.lock()
+        defer { self.readLock.unlock() }
+        
         self.checkUsageReset()
         
         let interfaceID = self.interfaceID
@@ -639,7 +646,11 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
             guard changed else { return }
             self.resetWiFiDetails()
             self.getWiFiDetails()
-            self.callback(self.usage)
+            // between two reads `bandwidth` holds the raw interface counters (bytes since boot), not a speed:
+            // published as it is, every chart and widget showed a peak of several GB/s right after launch
+            var usage = self.usage
+            usage.bandwidth = Bandwidth()
+            self.callback(usage)
         }
     }
     
